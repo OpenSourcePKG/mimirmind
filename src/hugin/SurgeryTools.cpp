@@ -1369,7 +1369,8 @@ void SurgeryTools::registerCausalityOn(McpServer& server) {
         "the same size? Edit = 'vector' (a steer_vector) + 'alpha' (+ 'positions' all | last), "
         "or 'head_edits' [{block, heads, scale}]. Metric over 'prompts': with 'target' the "
         "change of the target token's log-prob (signed — the edit must raise it), otherwise "
-        "KL(base || edited) of the next-token distribution. Baseline: 'random_edits' (default 8) "
+        "KL(base || edited) of the next-token distribution. Baseline: 'random_edits' (default 16; "
+        "below 21 edits the p95 is their maximum, i.e. conservative) "
         "mean differences of the vector's own fitting prompts under shuffled labels, rescaled to "
         "the same norm (a data-derived direction always beats a random one in R^d, so that "
         "baseline would be too easy), or random other heads of the same count per block at the "
@@ -1396,7 +1397,7 @@ void SurgeryTools::registerCausalityOn(McpServer& server) {
             if (texts.empty()) {
                 throw std::runtime_error("'prompts' must be a non-empty array");
             }
-            const std::size_t R = a.value("random_edits", std::size_t{8});
+            const std::size_t R = a.value("random_edits", std::size_t{16});
             if (R < 4 || R > 64) {
                 throw std::runtime_error("'random_edits' must be in [4, 64]");
             }
