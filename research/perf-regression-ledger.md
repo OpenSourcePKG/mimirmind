@@ -615,3 +615,27 @@ agentic / needle flows unaffected (the flags only touch the decode MoE path).
 src/runtime/arch/Qwen3_5Backend.hpp + Qwen3_5MoeBackend.cpp (shexp env-gate),
 src/runtime/ProbeConfig.{hpp,cpp} + InferenceEngine.cpp (overlay wiring fix),
 tools/microbench/fp8_dense_gemv_bench.cu (de-risk tool). Commits local (user pushes).
+
+## 2026-11-22 — 7.2.5 big-block pool release after NVFP4 load (GB10 prod deploy)
+
+**Binary:** prod fb75762d -> 1c493357 (HEAD incl. 7.2.3 shared weight arena, inert
+without `sharedWeights` in the config, + 7.2.5 compactAfterLoad). Config unchanged
+(243ce00d). Rollback: `build-cudnn/mimirmind.prodbak_725`, or env
+`MIMIRMIND_POOL_COMPACT=0` for the old pool behaviour.
+
+**Cause:** the 150 Kolibri-1 routed-expert source slabs (512 MiB pool blocks)
+stayed free but resident after the FP4-TC bank repack (banks are not pool
+allocations) — ~41 GiB pinned for the process lifetime.
+
+**Window A/B (full 4-model prod config, HEAD binary, OFF vs ON):**
+
+| | OFF | ON |
+|---|---|---|
+| MemAvailable after load | 24.9 GiB | 66.1 GiB |
+| kolibri1 decode conc1 (tok/s) | 29.6 / 29.8 | 29.7 / 30.0 |
+| kolibri1 decode conc8 (tok/s) | 62.2 / 64.5 | 62.8 / 64.6 |
+| greedy probe (10 prompts) | — | identical 10/10 |
+
+**Live verify after deploy:** health 200 (4 models), restarts 0, MemAvailable
+64.5 GiB after a bench, probe identical to the window 10/10, conc1 29.5, conc8
+63.2 tok/s, embed + rerank OK, 0 illegal access. Pool release at load: 0.6 s.
