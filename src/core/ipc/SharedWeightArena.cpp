@@ -22,6 +22,9 @@
 #ifndef MADV_POPULATE_WRITE
 #define MADV_POPULATE_WRITE 23
 #endif
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
 
 namespace mimirmind::core::ipc {
 
@@ -48,6 +51,37 @@ std::uint64_t roundUpPage(std::uint64_t b) noexcept {
 
 std::string errnoText(const char* what) {
     return std::string{what} + ": " + std::strerror(errno);
+}
+
+/// Map `bytes` of `fd` at a kHugePageBytes-aligned address (7.2.4): a PMD
+/// mapping needs the virtual address and the file offset congruent mod 2 MiB.
+/// Reserves bytes + 2 MiB of address space, maps the file over the aligned
+/// part and trims the slack. Returns MAP_FAILED on error (errno set).
+void* mapHugeAligned(int fd, std::uint64_t bytes, int prot) noexcept {
+    const std::uint64_t h = SharedWeightArena::kHugePageBytes;
+    void* res = ::mmap(nullptr, bytes + h, PROT_NONE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (res == MAP_FAILED) {
+        return MAP_FAILED;
+    }
+    const auto r   = reinterpret_cast<std::uintptr_t>(res);
+    const auto a   = (r + h - 1) & ~static_cast<std::uintptr_t>(h - 1);
+    void*      got = ::mmap(reinterpret_cast<void*>(a), bytes, prot,
+                            MAP_SHARED | MAP_FIXED | MAP_NORESERVE, fd, 0);
+    if (got == MAP_FAILED) {
+        const int e = errno;
+        ::munmap(res, bytes + h);
+        errno = e;
+        return MAP_FAILED;
+    }
+    if (a > r) {
+        ::munmap(res, a - r);
+    }
+    const std::uintptr_t end = r + bytes + h, mapEnd = a + bytes;
+    if (end > mapEnd) {
+        ::munmap(reinterpret_cast<void*>(mapEnd), end - mapEnd);
+    }
+    return got;
 }
 
 } // namespace
@@ -79,8 +113,7 @@ SharedWeightArena::create(const std::string& name, std::uint64_t reserveBytes) n
         ::close(static_cast<int>(fd));
         return std::unexpected(std::move(e));
     }
-    void* base = ::mmap(nullptr, reserveBytes, PROT_READ | PROT_WRITE,
-                        MAP_SHARED | MAP_NORESERVE, static_cast<int>(fd), 0);
+    void* base = mapHugeAligned(static_cast<int>(fd), reserveBytes, PROT_READ | PROT_WRITE);
     if (base == MAP_FAILED) {
         std::string e = errnoText("SharedWeightArena: mmap");
         ::close(static_cast<int>(fd));
@@ -104,7 +137,7 @@ SharedWeightArena::attach(int fd, std::uint64_t mapBytes, bool readOnly) noexcep
                                "advertised extent");
     }
     const int prot = readOnly ? PROT_READ : (PROT_READ | PROT_WRITE);
-    void* base = ::mmap(nullptr, mapBytes, prot, MAP_SHARED | MAP_NORESERVE, fd, 0);
+    void* base = mapHugeAligned(fd, mapBytes, prot);
     if (base == MAP_FAILED) {
         std::string e = errnoText("SharedWeightArena::attach: mmap");
         ::close(fd);
@@ -194,6 +227,34 @@ void SharedWeightArena::deallocate(void* ptr) noexcept {
     // Give the pages back to the OS; the range reads as zero afterwards.
     (void)::fallocate(_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
                       static_cast<off_t>(off), static_cast<off_t>(len));
+}
+
+SharedWeightArena::CollapseStats
+SharedWeightArena::collapseHugePages(std::uint64_t offset, std::uint64_t bytes) noexcept {
+    CollapseStats st;
+    const std::uint64_t h     = kHugePageBytes;
+    const std::uint64_t begin = offset / h * h;
+    const std::uint64_t end   = std::min(_mapBytes, (offset + bytes + h - 1) / h * h);
+    // One madvise per 2 MiB: madvise_collapse aborts the REST of its range on
+    // most failure classes (EINVAL), so a single bad huge page inside a larger
+    // call strands everything after it (7.2.4 window: 22.9 of 46.8 GiB with
+    // 1 GiB calls). EAGAIN (page busy / locked) gets one retry.
+    for (std::uint64_t o = begin; o < end; o += h) {
+        void* p  = static_cast<std::uint8_t*>(_base) + o;
+        int   rc = ::madvise(p, h, MADV_COLLAPSE);
+        if (rc != 0 && errno == EAGAIN) {
+            rc = ::madvise(p, h, MADV_COLLAPSE);
+        }
+        if (rc == 0) {
+            st.collapsedBytes += h;
+        } else {
+            st.failedBytes += h;
+            if (st.firstErrno == 0) {
+                st.firstErrno = errno;
+            }
+        }
+    }
+    return st;
 }
 
 bool SharedWeightArena::contains(const void* ptr) const noexcept {

@@ -38,6 +38,14 @@ namespace mimirmind::core::ipc {
 class SharedWeightArena {
 public:
     static constexpr std::size_t kPageBytes = 4096;
+    /// PMD size; mappings are aligned to it so ranges can be PMD-mapped.
+    static constexpr std::size_t kHugePageBytes = 2ull << 20;
+
+    struct CollapseStats {
+        std::uint64_t collapsedBytes{0};
+        std::uint64_t failedBytes{0};
+        int           firstErrno{0};   ///< errno of the first failed range
+    };
 
     [[nodiscard]] static std::expected<std::unique_ptr<SharedWeightArena>, std::string>
     create(const std::string& name, std::uint64_t reserveBytes) noexcept;
@@ -60,6 +68,16 @@ public:
     /// Return a range from `allocate` and release its pages. Unknown pointers
     /// are ignored (logged by the caller if it cares).
     void deallocate(void* ptr) noexcept;
+
+    /// 7.2.4: MADV_COLLAPSE the mapped range [offset, offset + bytes), widened
+    /// to 2 MiB boundaries, onto 2 MiB pages. Works with THP shmem_enabled=never
+    /// (MADV_COLLAPSE ignores the sysfs policy). On GB10 the GPU reads this
+    /// mapping through ATS; with 4 KiB pages scattered reads drop to 29-100 GB/s
+    /// vs 161 GB/s managed, collapsed they match managed. Holes inside a 2 MiB
+    /// range are filled with zero pages. Pinned pages (cudaHostRegister) do not
+    /// collapse, so call this before registering. Valid for attach mappings too.
+    [[nodiscard]] CollapseStats collapseHugePages(std::uint64_t offset,
+                                                  std::uint64_t bytes) noexcept;
 
     [[nodiscard]] bool contains(const void* ptr) const noexcept;
     /// Byte offset of `ptr` from the arena base. Precondition: contains(ptr).

@@ -596,6 +596,9 @@ void InferenceEngine::loadModelSharedArena(std::string_view             checkpoi
                 "attached '{}' read-only: {} tensors, {} MiB mapped (owner model '{}')",
                 std::string{checkpointDir}, _materializedBf16.size(), m.mapBytes >> 20,
                 m.modelId);
+    // The owner's page cache already holds 2 MiB folios; this only installs
+    // PMD mappings in our own page tables.
+    collapseWeightArena(*_weightArena, m.mapBytes);
     _pleCheckpointDir = std::string{checkpointDir};
     finalizeLoad();
 #endif
@@ -637,6 +640,31 @@ void InferenceEngine::beginWeightArena() {
 #endif
 }
 
+void InferenceEngine::collapseWeightArena(core::ipc::SharedWeightArena& arena,
+                                          std::uint64_t                 extent) {
+    // 7.2.4: 2 MiB pages for the GPU's ATS reads (see collapseHugePages).
+    const char* env = std::getenv("MIMIRMIND_ARENA_HUGE");
+    if (env != nullptr && env[0] == '0') {
+        MM_LOG_INFO("arena", "model '{}': huge-page collapse skipped (MIMIRMIND_ARENA_HUGE=0)",
+                    _modelIdHint);
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto st = arena.collapseHugePages(0, extent);
+    const double secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (st.failedBytes == 0) {
+        MM_LOG_INFO("arena", "model '{}': {} MiB collapsed onto 2 MiB pages in {:.1f} s",
+                    _modelIdHint, st.collapsedBytes >> 20, secs);
+    } else {
+        MM_LOG_WARN("arena",
+                    "model '{}': huge-page collapse incomplete — {} MiB collapsed, {} MiB "
+                    "left on 4 KiB pages ({}); scattered GPU reads on those ranges are slower",
+                    _modelIdHint, st.collapsedBytes >> 20, st.failedBytes >> 20,
+                    std::strerror(st.firstErrno));
+    }
+}
+
 void InferenceEngine::sealWeightArena() {
 #ifdef MIMIRMIND_HAVE_CUDA
     auto& alloc =
@@ -654,6 +682,7 @@ void InferenceEngine::sealWeightArena() {
                 "{} buffer(s) moved in after load",
                 _modelIdHint, _weightArena->liveAllocations(),
                 _weightArena->liveBytes() >> 20, _weightArena->peakBytes() >> 20, moved);
+    collapseWeightArena(*_weightArena, _weightArena->highWaterBytes());
     if (_sharedExport && _sharedExport->hostRegister) {
         const std::uint64_t extent = _weightArena->highWaterBytes();
         void* base = _weightArena->base();

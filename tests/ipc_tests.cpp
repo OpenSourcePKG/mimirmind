@@ -1303,6 +1303,37 @@ TEST(sharedWeightArena_attachSeesOwnerBytesReadOnly) {
     ::close(ro);
 }
 
+TEST(sharedWeightArena_hugeAlignedCollapseKeepsBytes) {
+    auto a = SharedWeightArena::create("test-huge", 8u << 20);
+    EXPECT_TRUE(a.has_value());
+    if (!a) return;
+    const auto h = SharedWeightArena::kHugePageBytes;
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>((*a)->base()) % h, std::uintptr_t{0});
+    auto* p = static_cast<std::uint32_t*>((*a)->allocate(4u << 20));
+    EXPECT_TRUE(p != nullptr);
+    if (p == nullptr) return;
+    const std::size_t n = (4u << 20) / sizeof(std::uint32_t);
+    for (std::size_t i = 0; i < n; ++i) p[i] = static_cast<std::uint32_t>(i * 2654435761u);
+    // Kernel support varies (MADV_COLLAPSE needs 6.1+ and THP); the range
+    // accounting and the bytes must hold either way.
+    const auto st = (*a)->collapseHugePages(4096, (4u << 20) - 8192);
+    EXPECT_EQ(st.collapsedBytes + st.failedBytes, std::uint64_t{4} << 20);
+    bool same = true;
+    for (std::size_t i = 0; i < n; ++i) same = same && p[i] == static_cast<std::uint32_t>(i * 2654435761u);
+    EXPECT_TRUE(same);
+    // An attach mapping is aligned too.
+    const int dupFd = ::open(("/proc/self/fd/" + std::to_string((*a)->fd())).c_str(),
+                             O_RDONLY | O_CLOEXEC);
+    auto att = SharedWeightArena::attach(dupFd, 4u << 20, /*readOnly=*/true);
+    EXPECT_TRUE(att.has_value());
+    if (!att) return;
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>((*att)->base()) % h, std::uintptr_t{0});
+    const auto st2 = (*att)->collapseHugePages(0, 4u << 20);
+    EXPECT_EQ(st2.collapsedBytes + st2.failedBytes, std::uint64_t{4} << 20);
+    EXPECT_EQ(static_cast<const std::uint32_t*>((*att)->base())[12345],
+              static_cast<std::uint32_t>(12345u * 2654435761u));
+}
+
 TEST(weightArenaManifest_roundTrip) {
     const WeightArenaManifest m = sampleManifest();
     auto back = WeightArenaManifest::fromJson(m.toJson());

@@ -1207,6 +1207,8 @@ private:
     void requirePageableMemoryAccess(const char* what) const;
     void beginWeightArena();
     void sealWeightArena();
+    /// 7.2.4: MADV_COLLAPSE [0, extent) of `arena`; logs, never throws.
+    void collapseWeightArena(core::ipc::SharedWeightArena& arena, std::uint64_t extent);
     void publishWeightArena(std::string_view                checkpointDir,
                             const std::vector<std::string>& runes);
     /// FusedQkvWeights + GPU-op self-test + matmul autotune (L0-only paths).
