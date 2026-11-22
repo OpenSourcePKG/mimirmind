@@ -266,8 +266,8 @@ Forward genau wie im Serving erreichen.
 | `perplexity` | Teacher-forced Logprob je Token, NLL, Perplexity |
 | `logit_lens` | Residual nach jedem Block durch Final-Norm + lm_head |
 | `activations` | Residual-Statistik je Block (Norm, Update, Kosinus, Top-Dims) |
-| `attention_pattern` | Attention-Gewichte eines Blocks je Head, aus dem Post-RoPE-Q/K der Engine rekonstruiert |
-| `expert_usage` | Tatsächlich genommenes MoE-Routing (Stage-Tap an der Router-Auswahl) |
+| `attention_pattern` | Attention-Gewichte eines Blocks je Head, aus dem Post-RoPE-Q/K der Engine rekonstruiert (llama / qwen2 / kolibri1 / gemma4 / Full-Attention-Blöcke der qwen35-Hybride; F32-KV-Cache). Unter cuDNN-SDPA zeigt der Konsistenz-Check dessen bf16-Rundung (~1e-2 relativ); `MIMIRMIND_ATTN_CUDNN=0` liefert den exakten F32-Kernel |
+| `expert_usage` | Tatsächlich genommenes MoE-Routing (Stage-Tap an der Router-Auswahl; qwen35moe-Familie, gemma4-MoE, kolibri1) |
 | `trace` | Ein Forward, alles für ein Bild des Laufs: Tokens, Next-Token-Top-k, pro Block Logit-Lens + Residual (standardmäßig der rohe Vektor), Attention-Muster jedes Blocks mit Stages, MoE-Routing, Modellgrößen und Layer-Art pro Block. Die Abschnitte tragen Namen und Form der Einzel-Tools (z. B. für jsNGraphs NetView) |
 | `causal_trace` | Activation Patching clean → corrupt je (Block, Position) |
 | `causality_check` | Bewirkt ein gefundener Eingriff (Steer-Vektor bei α oder Head-Edits) mehr als ein zufälliger gleicher Größe? Dosis-Sweep + Verdikt causal / weak / epiphenomenal / undetermined + gemessene Dosis (§4) |

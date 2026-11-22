@@ -588,10 +588,27 @@ void Qwen3_5Backend::runFullAttentionBlock(std::size_t   blockIdx,
     // --- GQA attention -----------------------------------------------
     trace("attention");
     const float attnScale = _config.attentionScaleFor(head_dim);
+    // 7.2.2 Hugin: post-QK-norm/post-IMRoPE Q and the whole K/V history this
+    // attention reads. Only an F32 cache holds that history as plain floats,
+    // so other KV dtypes expose no attention stages. No-op unless asked.
+    const bool tapAttention = kvDtype == KvDtype::F32;
+    if (tapAttention) {
+        tapStage(_gmm, _ops, "Qcur", blockIdx, qBuf, T, q_dim);
+        tapStage(_gmm, _ops, "Kcur", blockIdx, static_cast<const float*>(cache.baseK(kvL)),
+                 totalLen, kv_dim);
+        tapStage(_gmm, _ops, "Vcur", blockIdx, static_cast<const float*>(cache.baseV(kvL)),
+                 totalLen, kv_dim);
+    }
     _ops.attentionAsync(qBuf, cache.baseK(kvL), cache.baseV(kvL),
                         T, totalLen, nHeads, nKvHeads, head_dim,
                         curLen, attnScale, attnOutBuf,
                         /*slidingWindow=*/0, kvDtype);
+    // 7.2.2 Hugin: the per-head context before the output gate (editable, so
+    // a head ablation also silences that head's gated output) + exact scale.
+    if (tapAttention) {
+        tapStageMutable(_gmm, _ops, "attn_ctx", blockIdx, attnOutBuf, T, q_dim);
+        tapStageHost("attn_scale", blockIdx, &attnScale, 1, 1);
+    }
 
     // --- per-head output gate: attn *= sigmoid(gate) -----------------
     trace("output sigmoid gate");

@@ -255,8 +255,8 @@ exactly as in serving.
 | `perplexity` | Teacher-forced per-token logprob, NLL, perplexity |
 | `logit_lens` | Residual after each block through final norm + lm_head |
 | `activations` | Residual statistics per block (norm, update, cosine, top dims) |
-| `attention_pattern` | One block's attention weights per head, rebuilt from the engine's post-RoPE Q/K |
-| `expert_usage` | MoE routing actually taken (stage tap at the router selection) |
+| `attention_pattern` | One block's attention weights per head, rebuilt from the engine's post-RoPE Q/K (llama / qwen2 / kolibri1 / gemma4 / full-attention blocks of qwen35 hybrids; F32 KV cache). Under cuDNN SDPA the consistency check shows its bf16 rounding (~1e-2 relative); `MIMIRMIND_ATTN_CUDNN=0` gives the exact F32 kernel |
+| `expert_usage` | MoE routing actually taken (stage tap at the router selection; qwen35moe family, gemma4 MoE, kolibri1) |
 | `trace` | One forward, everything for a picture of the run: tokens, next-token top-k, per block logit lens + residual (raw vector by default), attention pattern of every block that exposes the stages, MoE routing, model sizes and per-block layer kinds. Sections carry the single tools' names and shapes (e.g. for jsNGraph's NetView) |
 | `causal_trace` | Activation patching clean → corrupt per (block, position) |
 | `causality_check` | Is a located edit (steer vector at α, or head edits) more than a random edit of the same size? Dose sweep + verdict causal / weak / epiphenomenal / undetermined + measured dose (§4) |

@@ -393,7 +393,9 @@ void ForwardTools::registerOn(McpServer& server) {
         "'span' [start, end) adds each head's weight mass on that token range and ranks the "
         "heads by it (e.g. which heads read the system instruction). Sliding-window layers are "
         "masked like the kernel. Supported where the backend exposes the stages (llama / qwen2 / "
-        "kolibri1 today).",
+        "kolibri1 / gemma4 / the full-attention blocks of qwen35-family hybrids) with an F32 KV "
+        "cache. Under cuDNN SDPA (Q/K/V staged to bf16) 'consistency' shows that rounding "
+        "(~1e-2 relative); MIMIRMIND_ATTN_CUDNN=0 gives the exact F32 kernel.",
         schema(textProps({{"block", {{"type", "integer"}}},
                           {"heads", {{"type", "array"}, {"items", {{"type", "integer"}}}}},
                           {"position", {{"type", "integer"}}},
@@ -494,7 +496,7 @@ void ForwardTools::registerOn(McpServer& server) {
         "reflects bias / device top-K exactly). Per block: distinct experts used, load entropy, "
         "top experts by token count and by routing weight; 'position' adds that token's picks. "
         "With 'runes' the routing of the rune-applied model is reported (e.g. to prove an expert "
-        "disable). Supported: qwen35moe-family and kolibri1 backends.",
+        "disable). Supported: qwen35moe-family, gemma4 MoE and kolibri1 backends.",
         schema(textProps({{"blocks", {{"type", "array"}, {"items", {{"type", "integer"}}}}},
                           {"position", {{"type", "integer"}}},
                           {"top_k", {{"type", "integer"}}},

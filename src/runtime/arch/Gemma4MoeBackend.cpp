@@ -8,6 +8,7 @@
 #include "compute/MoeRouting.hpp"
 #include "compute/QuantType.hpp"
 #include "compute/QuantTypeRegistry.hpp"
+#include "runtime/arch/ArchBackend.hpp"
 #include "core/gguf/GgufReader.hpp"
 #include "core/gguf/GgufTypes.hpp"
 #include "model/LlmConfig.hpp"
@@ -241,6 +242,21 @@ void Gemma4MoeBackend::runFfnMoeSection(std::size_t   blockIdx,
     // Only take the device dispatch path if the device top-K actually ran
     // (a launch failure above leaves the host _topKIdx authoritative).
     const bool useDeviceDispatch = wantDeviceDispatch && deviceTopKDone;
+
+    // 7.2.2 Hugin: the routing this block actually takes (expert ids + router
+    // weights before the per-expert down scale). Under full device dispatch
+    // the host pick buffers are never filled, so read the device ones.
+    if (_owner != nullptr) {
+        if (useDeviceDispatch) {
+            _owner->tapStageI32(_gmm, _ops, "moe_topk_idx", blockIdx,
+                                _devTopKIdx.as<std::int32_t>(), T, K);
+            _owner->tapStage(_gmm, _ops, "moe_topk_w", blockIdx,
+                             _devTopKWeight.as<float>(), T, K);
+        } else {
+            _owner->tapStageHostI32("moe_topk_idx", blockIdx, _topKIdx.data(), T, K);
+            _owner->tapStageHost("moe_topk_w", blockIdx, _topKWeight.data(), T, K);
+        }
+    }
 
     _op.mark(runtime::OpProfiler::Cat::RESIDUAL);
     trace("path B: zero accumulator");

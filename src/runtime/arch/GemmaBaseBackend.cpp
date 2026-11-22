@@ -667,6 +667,20 @@ void GemmaBaseBackend::attendAndProject(const AttnSectionState& st,
     // tokens. See M5i.J.1 Synaipse ticket.
     const std::size_t slidingWindow =
         li.isSwa ? static_cast<std::size_t>(_config.slidingWindow) : 0;
+    // 7.2.2 Hugin: post-norm/post-RoPE Q and the whole K/V history this
+    // attention reads (the source layer's cache for shared-KV layers). Only
+    // an F32 cache holds that history as plain floats, so other KV dtypes
+    // expose no attention stages. No-op unless a stage tap asks.
+    const bool tapAttention = _owner != nullptr && st.kvDtype == KvDtype::F32;
+    if (tapAttention) {
+        _owner->tapStage(_gmm, _ops, "Qcur", st.blockIdx, st.qBuf, T, st.qDim);
+        _owner->tapStage(_gmm, _ops, "Kcur", st.blockIdx,
+                         static_cast<const float*>(cache.baseK(li.kvSourceLayer)),
+                         st.totalLen, st.kvDim);
+        _owner->tapStage(_gmm, _ops, "Vcur", st.blockIdx,
+                         static_cast<const float*>(cache.baseV(li.kvSourceLayer)),
+                         st.totalLen, st.kvDim);
+    }
     _ops.attentionAsync(st.qBuf,
                         cache.baseK(li.kvSourceLayer),
                         cache.baseV(li.kvSourceLayer),
@@ -676,6 +690,15 @@ void GemmaBaseBackend::attendAndProject(const AttnSectionState& st,
                         st.attnOutBuf,
                         slidingWindow,
                         st.kvDtype);
+    // 7.2.2 Hugin: per-head context before the O-projection (editable for
+    // head ablation / scaling previews) plus the exact scale and window.
+    if (tapAttention) {
+        _owner->tapStageMutable(_gmm, _ops, "attn_ctx", st.blockIdx, st.attnOutBuf, T, st.qDim);
+        const float scale = _yarnMscale;
+        _owner->tapStageHost("attn_scale", st.blockIdx, &scale, 1, 1);
+        const float windowF = static_cast<float>(slidingWindow);
+        _owner->tapStageHost("attn_window", st.blockIdx, &windowF, 1, 1);
+    }
 
     _op.mark(runtime::OpProfiler::Cat::MATMUL);
     trace("O projection");

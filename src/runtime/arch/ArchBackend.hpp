@@ -362,9 +362,9 @@ public:
     bool applyLowRank(std::size_t block, std::string_view tensor, const float* in,
                       std::size_t rows, float* out, float* matmulScratch);
 
-protected:
-    ArchBackend() = default;
-
+    /// 7.2 Hugin stage taps. Public so composed impls that are not
+    /// ArchBackends themselves (GemmaBaseBackend via its owner) can tap.
+    /// All of them are no-ops unless a tap is installed and wants the stage.
     /// True iff a tap is installed and wants (stage, block).
     [[nodiscard]] bool stageTapWants(std::string_view stage, std::size_t block) const {
         return _stageTap.wants && _stageTap.onStage && _stageTap.wants(stage, block);
@@ -389,6 +389,10 @@ protected:
                      const std::int32_t* device, std::size_t rows, std::size_t cols) const;
     void tapStageHostI32(std::string_view stage, std::size_t block,
                          const std::int32_t* host, std::size_t rows, std::size_t cols) const;
+
+
+protected:
+    ArchBackend() = default;
 
     /// Build this backend's capability flags (8.30.8). Replaces the former
     /// eight individual capability virtuals. Called once, lazily, by
