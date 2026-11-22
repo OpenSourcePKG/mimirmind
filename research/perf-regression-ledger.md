@@ -655,3 +655,20 @@ conc1 29.73 vs managed 29.70, conc8 63.93 vs 63.87 tok/s; answers identical 10/1
 socket, probe identical to pre-deploy prod 10/10, conc1 29.4/29.8, conc8 62.9/64.5
 tok/s, embed + rerank OK, 0 illegal access, MemAvailable 64.7 GiB.
 Hugin can now attach to prod with `--attach /src/run/kolibri1.sock`.
+
+## 2026-11-22 — 7.8 zeroAsync (no zeroing by multiply-with-0) on GB10 prod
+
+**Binary:** prod fe8e80a9 -> 5ba74725 (HEAD: 7.8 zeroAsync fix + inert 7.2.2 stage
+taps; no kernel changes). **Config:** unchanged (880b7611). Rollback:
+`build-cudnn/mimirmind.prodbak_78`.
+
+**Why:** sequence-start resets of the GDN SSM/conv state and the MoE accumulators
+(serving slots included) "zeroed" with `mulScalarAsync(buf, 0)`; 0 * NaN = NaN, so a
+buffer holding a NaN/Inf pattern stayed poisoned. Now a memset (`zeroAsync`).
+
+**Live verify:** health 200 (4 models), restarts 0, conc1 29.5 -> 29.6, conc8
+64.3 -> 63.2 tok/s (in the run-to-run range of the 7.2.4 deploy: 62.9 / 64.5),
+embed + rerank OK, 0 illegal access, 0 NaN log lines, MemAvailable 64.7 GiB.
+Greedy probe 9/10 identical to the pre-deploy run; the one differing answer
+(transformer explanation) is word-for-word the 7.2.4 / 7.2.5 reference, i.e. the
+long-running pre-deploy prod was the outlier (near-tie token), not the new binary.
