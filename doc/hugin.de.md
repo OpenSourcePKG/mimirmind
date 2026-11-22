@@ -268,6 +268,7 @@ Forward genau wie im Serving erreichen.
 | `activations` | Residual-Statistik je Block (Norm, Update, Kosinus, Top-Dims) |
 | `attention_pattern` | Attention-Gewichte eines Blocks je Head, aus dem Post-RoPE-Q/K der Engine rekonstruiert (llama / qwen2 / kolibri1 / gemma4 / Full-Attention-Blöcke der qwen35-Hybride; F32-KV-Cache). Unter cuDNN-SDPA zeigt der Konsistenz-Check dessen bf16-Rundung (~1e-2 relativ); `MIMIRMIND_ATTN_CUDNN=0` liefert den exakten F32-Kernel |
 | `expert_usage` | Tatsächlich genommenes MoE-Routing (Stage-Tap an der Router-Auswahl; qwen35moe-Familie, gemma4-MoE, kolibri1) |
+| `expert_saliency` | REAP-Expert-Salienz über ein Kalibrier-Set: pro Block Mittel aus Routing-Gewicht × Norm der Expert-Ausgabe (Stage-Tap `moe_expert_norm`; kolibri1, qwen35moe Single-Session-Prefill), Frequenz als Baseline, Prune-Listen pro Anteil |
 | `trace` | Ein Forward, alles für ein Bild des Laufs: Tokens, Next-Token-Top-k, pro Block Logit-Lens + Residual (standardmäßig der rohe Vektor), Attention-Muster jedes Blocks mit Stages, MoE-Routing, Modellgrößen und Layer-Art pro Block. Die Abschnitte tragen Namen und Form der Einzel-Tools (z. B. für jsNGraphs NetView) |
 | `causal_trace` | Activation Patching clean → corrupt je (Block, Position) |
 | `causality_check` | Bewirkt ein gefundener Eingriff (Steer-Vektor bei α oder Head-Edits) mehr als ein zufälliger gleicher Größe? Dosis-Sweep + Verdikt causal / weak / epiphenomenal / undetermined + gemessene Dosis (§4) |
@@ -296,6 +297,7 @@ Forward genau wie im Serving erreichen.
 | `rune_stage_ablate` | Head-Ablation → 0/1-Spalten-`scale` auf `attn_output` |
 | `rune_stage_heads` | Head-Skalierung → Spalten-`scale` (exakt auf Q8_0-/FP8-Block-Scales für 0 oder Zweierpotenzen) |
 | `rune_stage_experts` | Experten abschalten → `mask` auf dem MoE-Router |
+| `rune_stage_expert_prune` | Experten über mehrere Blöcke in einer Rune abschalten (ein Router-`mask` pro Block, z. B. aus `expert_saliency`); die Experten bleiben im Speicher |
 | `rune_derive_lowrank` | Neue gestagte LowRank-Rune aus einer Teilmenge der Adapter einer anderen (Blöcke, Projektionen), alpha × `scale`; Adapter-Ablation ohne Neutraining |
 | `rune_gate` | Target-/Control-Gate, Basis vs. Rune (§4) |
 | `rune_commit` | Grün + byte-gleich → `committed/`, liefert die Config-Zeile |

@@ -644,6 +644,10 @@ void Qwen3_5MoeBackend::runMoeFfn(std::size_t   blockIdx,
         }
     } else {
         // Sequential per-token top-K dispatch (prefill / no fused kernel).
+        // 7.9 Hugin: ||f_j(x)|| per (token, slot) for REAP saliency (probe-only).
+        const bool tapNorms = stageTapWants("moe_expert_norm", blockIdx);
+        std::vector<float> norms(tapNorms ? T * K : 0);
+        std::vector<float> row(tapNorms ? d_model : 0);
         for (std::size_t t = 0; t < T; ++t) {
             const float* const xt     = moeInput    + t * d_model;
             float* const       accumT = moeAccumBuf + t * d_model;
@@ -664,10 +668,22 @@ void Qwen3_5MoeBackend::runMoeFfn(std::size_t   blockIdx,
                 _ops.siluMulAsync(gateOutBuf, upOutBuf, n_ff_exp);  // silu(gate)*up
                 _gmm.matmulAsync(downExps.type, Wd, d_model, n_ff_exp,
                                  gateOutBuf, 1, expertOutBuf, matmulScratch);
+                if (tapNorms) {
+                    _gmm.sync();
+                    _ops.readbackToHost(row.data(), expertOutBuf, d_model * sizeof(float));
+                    double sq = 0.0;
+                    for (const float v : row) {
+                        sq += static_cast<double>(v) * v;
+                    }
+                    norms[t * K + k] = static_cast<float>(std::sqrt(sq));
+                }
 
                 _ops.scaledAddResidualAsync(accumT, expertOutBuf,
                                             routerWeight * wScale, d_model);
             }
+        }
+        if (tapNorms) {
+            tapStageHost("moe_expert_norm", blockIdx, norms.data(), T, K);
         }
     }
 

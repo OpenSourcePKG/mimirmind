@@ -424,6 +424,38 @@ void Kolibri1Backend::runKolibriMoe(std::size_t blockIdx, const float* din,
             static_cast<const float*>(gExps.tcGlobalsPtr),
             static_cast<const float*>(uExps.tcGlobalsPtr),
             expIdx, gateActAll, T, d_model, nFfExp, K, sfbGu);
+        // 7.9 Hugin: ||f_j(x)|| per (token, slot) for REAP saliency. The down
+        // kernel is linear in the slot weights, so one extra launch per slot
+        // with a one-hot weight yields exactly that slot's expert output, from
+        // the same kernel as the real forward. Probe-only; serving never asks.
+        if (stageTapWants("moe_expert_norm", blockIdx)) {
+            _gmm.sync();   // device router writes kwDev on the stream
+            const std::vector<float> kwSaved(kwDev, kwDev + T * K);
+            std::vector<float>       norms(T * K, 0.0F);
+            std::vector<float>       rows(T * d_model);
+            for (std::size_t k = 0; k < K; ++k) {
+                for (std::size_t i = 0; i < T * K; ++i) {
+                    kwDev[i] = (i % K == k) ? 1.0F : 0.0F;
+                }
+                _ops.zeroAsync(expertOut, T * d_model);
+                _gmm.moeDownFusedKTcBatchedAsync(
+                    gateActAll, dExps.tcNibblePtr, dExps.tcSfbPtr,
+                    static_cast<const float*>(dExps.tcGlobalsPtr),
+                    expIdx, kwDev, expertOut, T, nFfExp, d_model, K, sfbDn);
+                _gmm.sync();
+                _ops.readbackToHost(rows.data(), expertOut, T * d_model * sizeof(float));
+                for (std::size_t t = 0; t < T; ++t) {
+                    double sq = 0.0;
+                    for (std::size_t c = 0; c < d_model; ++c) {
+                        const double v = rows[t * d_model + c];
+                        sq += v * v;
+                    }
+                    norms[t * K + k] = static_cast<float>(std::sqrt(sq));
+                }
+            }
+            std::copy(kwSaved.begin(), kwSaved.end(), kwDev);
+            tapStageHost("moe_expert_norm", blockIdx, norms.data(), T, K);
+        }
         _gmm.moeDownFusedKTcBatchedAsync(
             gateActAll, dExps.tcNibblePtr, dExps.tcSfbPtr,
             static_cast<const float*>(dExps.tcGlobalsPtr),
@@ -439,6 +471,9 @@ void Kolibri1Backend::runKolibriMoe(std::size_t blockIdx, const float* din,
         const auto* const upBase   = static_cast<const std::uint8_t*>(uExps.usmPtr);
         const auto* const downBase = static_cast<const std::uint8_t*>(dExps.usmPtr);
 
+        const bool tapNorms = stageTapWants("moe_expert_norm", blockIdx);   // 7.9 Hugin
+        std::vector<float> norms(tapNorms ? T * K : 0);
+        std::vector<float> row(tapNorms ? d_model : 0);
         for (std::size_t t = 0; t < T; ++t) {
             const float* const xt     = din      + t * d_model;
             float* const       accumT = moeAccum + t * d_model;
@@ -452,8 +487,20 @@ void Kolibri1Backend::runKolibriMoe(std::size_t blockIdx, const float* din,
                 _gmm.matmulAsync(uExps.type, Wu, nFfExp, d_model, xt, 1, upOut,   scratch);
                 _ops.siluMulAsync(gateOut, upOut, nFfExp);          // silu(gate)*up
                 _gmm.matmulAsync(dExps.type, Wd, d_model, nFfExp, gateOut, 1, expertOut, scratch);
+                if (tapNorms) {
+                    _gmm.sync();
+                    _ops.readbackToHost(row.data(), expertOut, d_model * sizeof(float));
+                    double sq = 0.0;
+                    for (const float v : row) {
+                        sq += static_cast<double>(v) * v;
+                    }
+                    norms[t * K + k] = static_cast<float>(std::sqrt(sq));
+                }
                 _ops.scaledAddResidualAsync(accumT, expertOut, wk, d_model);
             }
+        }
+        if (tapNorms) {
+            tapStageHost("moe_expert_norm", blockIdx, norms.data(), T, K);
         }
     }
 

@@ -8,6 +8,7 @@
 #include "core/rune/RuneApplier.hpp"
 #include "core/rune/RuneFile.hpp"
 #include "core/rune/RuneFormat.hpp"
+#include "hugin/ExpertSaliency.hpp"
 #include "hugin/ForwardReport.hpp"
 #include "hugin/ForwardTools.hpp"
 #include "hugin/GenerationCheck.hpp"
@@ -136,10 +137,10 @@ TEST(mcp_initialize_and_toolsList) {
     }
     std::sort(names.begin(), names.end());
     EXPECT_TRUE(names == (std::vector<std::string>{"ablate_preview", "activations", "attention_pattern", "causal_trace", "causality_check",
-                                                   "condition_vector", "edit_search", "eval", "eval_preview", "expert_usage", "generate", "list_tensors", "logit_lens",
+                                                   "condition_vector", "edit_search", "eval", "eval_preview", "expert_saliency", "expert_usage", "generate", "list_tensors", "logit_lens",
                                                    "model_info", "next_token", "open_model", "perplexity", "rune_check",
                                                    "rune_commit", "rune_compare", "rune_derive_lowrank", "rune_gate", "rune_inspect", "rune_list",
-                                                   "rune_rollback", "rune_stage_ablate", "rune_stage_experts", "rune_stage_heads",
+                                                   "rune_rollback", "rune_stage_ablate", "rune_stage_expert_prune", "rune_stage_experts", "rune_stage_heads",
                                                    "rune_stage_steer", "rune_stage_steer_if",
                                                    "steer_if_preview", "steer_list", "steer_preview",
                                                    "steer_vector", "tensor_hash",
@@ -281,7 +282,7 @@ TEST(forwardTools_withoutModel_reportToolError_noEngineBuilt) {
     hg::ForwardTools fwd{[] { return hg::ForwardTools::Target{}; }};
     fwd.registerOn(server);
     for (const char* tool : {"next_token", "perplexity", "logit_lens", "activations", "tokenize",
-                             "attention_pattern", "expert_usage", "trace"}) {
+                             "attention_pattern", "expert_usage", "expert_saliency", "trace"}) {
         const json r = (*server.handle({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
                                         {"params", {{"name", tool}, {"arguments", {{"text", "hi"}}}}}}))["result"];
         EXPECT_TRUE(r["isError"].get<bool>());
@@ -339,6 +340,8 @@ TEST(runeStaging_guards_withoutModel_andUnknownNames) {
     EXPECT_TRUE(errText(call("rune_stage_ablate", {{"name", "a"}, {"block", 0}, {"heads", {0}}}))
                     .find("open_model") != std::string::npos);
     EXPECT_TRUE(errText(call("rune_stage_experts", {{"name", "e"}, {"block", 0}, {"experts", {0}}}))
+                    .find("open_model") != std::string::npos);
+    EXPECT_TRUE(errText(call("rune_stage_expert_prune", {{"name", "p"}, {"prune", {{"0", {0}}}}}))
                     .find("open_model") != std::string::npos);
     EXPECT_TRUE(errText(call("rune_stage_steer", {{"name", "../x"}, {"vector", "v"}, {"alpha", 1.0}}))
                     .find("rune name") != std::string::npos);
@@ -716,6 +719,54 @@ TEST(surgery_causalityKeys_canonical) {
     EXPECT_TRUE(hg::vectorKey("fr", 1.0) == hg::vectorKey("fr", 1.0));
     EXPECT_TRUE(hg::vectorKey("fr", 1.0) != hg::vectorKey("fr", 0.5));
     EXPECT_TRUE(hg::vectorKey("fr", 1.0) != hg::vectorKey("de", 1.0));
+}
+
+TEST(expertSaliency_reap_is_mean_of_weight_times_norm) {
+    hg::ExpertSaliency sal{4};
+    // 2 tokens, top-2: token 0 -> experts 1 (w .6, n 2) and 2 (w .4, n 1);
+    // token 1 -> experts 1 (w .5, n 4) and 3 (w .5, n 3). Expert 0 unused.
+    const std::vector<float> idx{1, 2, 1, 3}, w{0.6F, 0.4F, 0.5F, 0.5F}, n{2, 1, 4, 3};
+    sal.add(idx, w, n, 2);
+    const auto st = sal.stats();
+    EXPECT_TRUE(sal.tokens() == 2);
+    EXPECT_TRUE(st[0].count == 0 && st[0].reap == 0.0);
+    EXPECT_TRUE(st[1].count == 2);
+    EXPECT_NEAR(st[1].reap, (0.6 * 2 + 0.5 * 4) / 2, 1e-6);
+    EXPECT_NEAR(st[2].reap, 0.4 * 1, 1e-6);
+    EXPECT_NEAR(st[3].reap, 0.5 * 3, 1e-6);
+    EXPECT_NEAR(st[1].normSum, 6.0, 1e-6);
+}
+
+TEST(expertSaliency_reap_prunes_frequent_but_weak_expert) {
+    hg::ExpertSaliency sal{4};
+    // Expert 0 is routed on every token but contributes almost nothing;
+    // expert 3 is rare but strong. REAP drops 0, frequency would drop 3.
+    for (int t = 0; t < 10; ++t) {
+        const float other = (t == 0) ? 3.0F : static_cast<float>(1 + t % 2);
+        const std::vector<float> idx{0, other}, w{0.5F, 0.5F};
+        const std::vector<float> n{0.01F, other == 3.0F ? 10.0F : 1.0F};
+        sal.add(idx, w, n, 2);
+    }
+    const auto byReap = sal.pruneByReap(1);
+    const auto byFreq = sal.pruneByFrequency(1);
+    EXPECT_TRUE(byReap == (std::vector<std::size_t>{0}));
+    EXPECT_TRUE(byFreq == (std::vector<std::size_t>{3}));
+    EXPECT_NEAR(hg::ExpertSaliency::jaccard(byReap, byFreq), 0.0, 1e-12);
+    EXPECT_NEAR(hg::ExpertSaliency::jaccard(std::vector<std::size_t>{1, 2}, std::vector<std::size_t>{2, 3}),
+                1.0 / 3.0, 1e-12);
+    // n larger than the expert count clamps; unused experts go first.
+    EXPECT_TRUE(sal.pruneByReap(9).size() == 4);
+}
+
+TEST(expertSaliency_rejects_bad_input) {
+    hg::ExpertSaliency sal{4};
+    const std::vector<float> bad{7}, one{1}, w{1}, n{1};
+    bool threw = false;
+    try { sal.add(bad, w, n, 1); } catch (const std::out_of_range&) { threw = true; }
+    EXPECT_TRUE(threw);
+    threw = false;
+    try { sal.add(one, w, std::vector<float>{}, 1); } catch (const std::invalid_argument&) { threw = true; }
+    EXPECT_TRUE(threw);
 }
 
 TEST(tpe_pareto_and_rank) {

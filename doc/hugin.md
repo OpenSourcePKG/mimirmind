@@ -257,6 +257,7 @@ exactly as in serving.
 | `activations` | Residual statistics per block (norm, update, cosine, top dims) |
 | `attention_pattern` | One block's attention weights per head, rebuilt from the engine's post-RoPE Q/K (llama / qwen2 / kolibri1 / gemma4 / full-attention blocks of qwen35 hybrids; F32 KV cache). Under cuDNN SDPA the consistency check shows its bf16 rounding (~1e-2 relative); `MIMIRMIND_ATTN_CUDNN=0` gives the exact F32 kernel |
 | `expert_usage` | MoE routing actually taken (stage tap at the router selection; qwen35moe family, gemma4 MoE, kolibri1) |
+| `expert_saliency` | REAP expert saliency over a calibration set: per block mean of routing weight × expert-output norm (stage tap `moe_expert_norm`; kolibri1, qwen35moe single-session prefill), frequency baseline, prune lists per fraction |
 | `trace` | One forward, everything for a picture of the run: tokens, next-token top-k, per block logit lens + residual (raw vector by default), attention pattern of every block that exposes the stages, MoE routing, model sizes and per-block layer kinds. Sections carry the single tools' names and shapes (e.g. for jsNGraph's NetView) |
 | `causal_trace` | Activation patching clean → corrupt per (block, position) |
 | `causality_check` | Is a located edit (steer vector at α, or head edits) more than a random edit of the same size? Dose sweep + verdict causal / weak / epiphenomenal / undetermined + measured dose (§4) |
@@ -285,6 +286,7 @@ exactly as in serving.
 | `rune_stage_ablate` | Head ablation → 0/1 column `scale` on `attn_output` |
 | `rune_stage_heads` | Head scaling → column `scale` (exact on Q8_0 / FP8 block scales for 0 or powers of two) |
 | `rune_stage_experts` | Expert disable → `mask` on the MoE router |
+| `rune_stage_expert_prune` | Multi-block expert disable in one Rune (one router `mask` per block, e.g. from `expert_saliency`); experts stay resident |
 | `rune_derive_lowrank` | New staged LowRank Rune from a subset of another one's adapters (blocks, projections) with alpha × `scale`; adapter ablation without retraining |
 | `rune_gate` | Target/control gate, base vs. Rune (§4) |
 | `rune_commit` | Green + byte-identical → `committed/`, returns the config line |

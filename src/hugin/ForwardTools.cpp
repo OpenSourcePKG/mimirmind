@@ -2,6 +2,7 @@
 // Copyright 2026 Stefan Werfling
 
 #include "hugin/ForwardTools.hpp"
+#include "hugin/ExpertSaliency.hpp"
 #include "hugin/ForwardReport.hpp"
 #include "hugin/ForwardSupport.hpp"
 
@@ -17,6 +18,8 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <map>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -529,6 +532,141 @@ void ForwardTools::registerOn(McpServer& server) {
             if (pos) {
                 out["position"] = *pos;
                 out["token_at_position"] = piece(e, ids[*pos]);
+            }
+            return out;
+        });
+
+    server.addTool(
+        "expert_saliency",
+        "REAP expert saliency (Cerebras REAP): per MoE block S_j = mean over the tokens routed to "
+        "expert j of g_j(x) * ||f_j(x)||_2 (routing weight times the expert's output norm, both "
+        "from engine stage taps), over a calibration set 'texts'. Next to it the token frequency, "
+        "the baseline REAP beats. For every fraction in 'fractions' (default [0.25, 0.5]) it "
+        "returns 'prune' = {fraction: {block: [lowest-REAP experts]}} (at most experts - top-K per "
+        "block), 'prune_frequency' (same by token count, the baseline) and their overlap; feed "
+        "one into rune_stage_expert_prune. "
+        "Use a DOMAIN-MATCHED calibration set (real prompts, tool calls, code, German) — generic "
+        "text alone collapses the domains it does not cover. Shared experts are never routed and "
+        "never pruned. Supported: kolibri1 and qwen35moe (single-session prefill path).",
+        schema(textProps({{"texts", {{"type", "array"}, {"items", {{"type", "string"}}},
+                                     {"description", "calibration prompts (raw text, one forward each)"}}},
+                          {"blocks", {{"type", "array"}, {"items", {{"type", "integer"}}}}},
+                          {"fractions", {{"type", "array"}, {"items", {{"type", "number"}}}}},
+                          {"top_k", {{"type", "integer"}, {"description", "experts listed per block (default 5)"}}},
+                          {"detail", {{"type", "boolean"}, {"description", "full per-expert stats per block"}}}}),
+               {}),
+        [this](const json& a) {
+            Engine& e = base();
+            const std::size_t nExp = e.config().expertCount;
+            const std::size_t topK = e.config().expertUsedCount;
+            if (nExp == 0 || topK == 0) {
+                throw std::runtime_error("the loaded model has no MoE experts");
+            }
+            std::vector<std::vector<std::int32_t>> inputs;
+            if (a.contains("texts")) {
+                for (const auto& t : a.at("texts")) {
+                    inputs.push_back(encodeText(e, t.get<std::string>(), a.value("add_bos", true)));
+                }
+            } else {
+                inputs.push_back(inputTokens(e, a));
+            }
+            if (inputs.empty()) {
+                throw std::runtime_error("pass 'texts' (or 'text' / 'tokens')");
+            }
+            const auto fractions = a.value("fractions", std::vector<double>{0.25, 0.5});
+            for (const double f : fractions) {
+                if (!(f > 0.0 && f < 1.0)) {
+                    throw std::runtime_error("fractions must lie in (0, 1)");
+                }
+            }
+            std::map<std::size_t, ExpertSaliency> perBlock;
+            std::size_t tokens = 0;
+            std::vector<std::size_t> noNorm;
+            for (const auto& ids : inputs) {
+                if (ids.empty()) {
+                    continue;
+                }
+                Engine::ForwardProbe probe;
+                probe.stages = {"moe_topk_idx", "moe_topk_w", "moe_expert_norm"};
+                if (a.contains("blocks")) {
+                    probe.stageBlocks = blockList(e, a);
+                }
+                (void)forward(e, ids, &probe);
+                tokens += ids.size();
+                for (const auto& [key, idx] : probe.stageData) {
+                    if (key.first != "moe_topk_idx") {
+                        continue;
+                    }
+                    const auto w = probe.stageData.find({"moe_topk_w", key.second});
+                    const auto n = probe.stageData.find({"moe_expert_norm", key.second});
+                    if (w == probe.stageData.end() || n == probe.stageData.end()) {
+                        noNorm.push_back(key.second);
+                        continue;
+                    }
+                    auto it = perBlock.try_emplace(key.second, nExp).first;
+                    it->second.add(idx.data, w->second.data, n->second.data, topK);
+                }
+            }
+            if (perBlock.empty()) {
+                throw std::runtime_error("no expert-output norms captured — '" + e.config().architecture +
+                                         "' has no moe_expert_norm tap on this path (supported: kolibri1, "
+                                         "qwen35moe single-session prefill; use more than one token)");
+            }
+            const std::size_t listN = a.value("top_k", std::size_t{5});
+            json blocks = json::array();
+            json prune  = json::object();
+            json pruneFreq = json::object();
+            for (const double f : fractions) {
+                prune[std::to_string(f)]     = json::object();
+                pruneFreq[std::to_string(f)] = json::object();
+            }
+            for (const auto& [blk, sal] : perBlock) {
+                const auto st = sal.stats();
+                std::vector<std::size_t> order(st.size());
+                std::iota(order.begin(), order.end(), std::size_t{0});
+                std::sort(order.begin(), order.end(),
+                          [&](std::size_t x, std::size_t y) { return st[x].reap > st[y].reap; });
+                const auto entry = [&](std::size_t j) {
+                    return json{{"expert", j}, {"reap", st[j].reap}, {"tokens", st[j].count}};
+                };
+                json top = json::array(), bottom = json::array();
+                for (std::size_t i = 0; i < std::min(listN, order.size()); ++i) {
+                    top.push_back(entry(order[i]));
+                    bottom.push_back(entry(order[order.size() - 1 - i]));
+                }
+                std::size_t used = 0;
+                for (const auto& x : st) {
+                    used += x.count > 0 ? 1 : 0;
+                }
+                json b{{"block", blk}, {"experts_used", used}, {"top", top}, {"bottom", bottom}};
+                json overlap = json::object();
+                for (const double f : fractions) {
+                    const std::size_t n = std::min(static_cast<std::size_t>(f * static_cast<double>(nExp)),
+                                                   nExp - topK);
+                    const auto byReap = sal.pruneByReap(n);
+                    const auto byFreq = sal.pruneByFrequency(n);
+                    prune[std::to_string(f)][std::to_string(blk)]     = byReap;
+                    pruneFreq[std::to_string(f)][std::to_string(blk)] = byFreq;
+                    overlap[std::to_string(f)] = ExpertSaliency::jaccard(byReap, byFreq);
+                }
+                b["reap_vs_frequency_jaccard"] = overlap;
+                if (a.value("detail", false)) {
+                    json all = json::array();
+                    for (const auto& x : st) {
+                        all.push_back({{"expert", x.expert}, {"tokens", x.count}, {"weight_sum", x.weightSum},
+                                       {"norm_sum", x.normSum}, {"reap", x.reap}});
+                    }
+                    b["experts"] = all;
+                }
+                blocks.push_back(std::move(b));
+            }
+            json out{{"prompts", inputs.size()}, {"tokens", tokens}, {"experts", nExp}, {"top_k", topK},
+                     {"moe_blocks", perBlock.size()}, {"blocks", blocks}, {"prune", prune},
+                     {"prune_frequency", pruneFreq}};
+            if (!noNorm.empty()) {
+                std::sort(noNorm.begin(), noNorm.end());
+                noNorm.erase(std::unique(noNorm.begin(), noNorm.end()), noNorm.end());
+                out["blocks_without_norm"] = noNorm;
             }
             return out;
         });

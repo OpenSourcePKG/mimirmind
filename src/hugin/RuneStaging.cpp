@@ -846,6 +846,100 @@ void RuneStaging::registerOn(McpServer& server) {
         });
 
     server.addTool(
+        "rune_stage_expert_prune",
+        "7.9 Write a multi-block expert disable as ONE staged Rune: 'prune' = {block: [experts]} "
+        "(e.g. one fraction of expert_saliency's 'prune'), one router Mask op per block. Same "
+        "mechanism and guardrails as rune_stage_experts, per block: disabled / block experts <= "
+        "'max_expert_fraction' (default 0.25, ceiling 0.25), at least top-K stay enabled. The "
+        "experts stay resident (no memory saving; a physical drop + healing is roadmap 7.5). Gate "
+        "it with rune_gate before anything else.",
+        schema({{"name", {{"type", "string"}}},
+                {"prune", {{"type", "object"}}},
+                {"max_expert_fraction", {{"type", "number"}}},
+                {"note", {{"type", "string"}}}},
+               {"name", "prune"}),
+        [this](const json& a) {
+            const std::string name = checkedName(a);
+            const std::string base = baseFingerprint();   // also: model loaded?
+            Engine& e = _forward.engine();
+            const std::size_t nExp = e.config().expertCount;
+            const std::size_t topK = e.config().expertUsedCount;
+            if (nExp == 0) {
+                throw std::runtime_error("the loaded model has no MoE experts");
+            }
+            const double maxFrac = budgetArg(a, "max_expert_fraction", kMaxExpertFraction, kMaxExpertFraction);
+            const json& prune = a.at("prune");
+            if (!prune.is_object() || prune.empty()) {
+                throw std::runtime_error("'prune' must be a non-empty object {block: [experts]}");
+            }
+            rn::RuneManifest man;
+            man.name            = name;
+            man.baseFingerprint = base;
+            std::map<std::string, std::vector<float>> payloads;
+            json perBlock = json::object();
+            std::size_t total = 0;
+            for (auto it = prune.begin(); it != prune.end(); ++it) {
+                const auto blk = blockList(e, json{{"blocks", json::array({std::stoll(it.key())})}}).front();
+                std::vector<std::size_t> experts;
+                for (const auto& x : it.value()) {
+                    const auto v = x.get<std::int64_t>();
+                    if (v < 0 || v >= static_cast<std::int64_t>(nExp)) {
+                        throw std::runtime_error("block " + std::to_string(blk) + ": expert " +
+                                                 std::to_string(v) + " out of range (0.." +
+                                                 std::to_string(nExp - 1) + ")");
+                    }
+                    experts.push_back(static_cast<std::size_t>(v));
+                }
+                std::sort(experts.begin(), experts.end());
+                experts.erase(std::unique(experts.begin(), experts.end()), experts.end());
+                if (experts.empty()) {
+                    continue;
+                }
+                const double frac = static_cast<double>(experts.size()) / static_cast<double>(nExp);
+                if (frac > maxFrac) {
+                    throw std::runtime_error("edit budget exceeded in block " + std::to_string(blk) + ": " +
+                                             std::to_string(experts.size()) + "/" + std::to_string(nExp) +
+                                             " experts > max_expert_fraction " + std::to_string(maxFrac));
+                }
+                if (nExp - experts.size() < topK) {
+                    throw std::runtime_error("block " + std::to_string(blk) + ": disabling " +
+                                             std::to_string(experts.size()) +
+                                             " experts leaves fewer than top-K " + std::to_string(topK));
+                }
+                const std::string target = "blk." + std::to_string(blk) + ".ffn_gate_inp.weight";
+                if (perBlock.contains(std::to_string(blk))) {
+                    throw std::runtime_error("block " + std::to_string(blk) + " listed twice");
+                }
+                std::vector<float> keep(nExp, 1.0F);
+                for (const auto x : experts) {
+                    keep[x] = 0.0F;
+                }
+                rn::RuneOp op;
+                op.kind    = rn::RuneOpKind::Mask;
+                op.target  = target;
+                op.payload = "experts." + target;
+                man.ops.push_back(op);
+                payloads.emplace(op.payload, std::move(keep));
+                perBlock[std::to_string(blk)] = experts;
+                total += experts.size();
+            }
+            if (man.ops.empty()) {
+                throw std::runtime_error("'prune' lists no experts");
+            }
+            json params{{"blocks", man.ops.size()}, {"experts_disabled", total}, {"block_experts", nExp},
+                        {"top_k", topK}, {"prune", perBlock}};
+            man.provenanceJson = json{{"tool", "hugin"}, {"hugin_version", _version},
+                                      {"kind", "disable_experts"}, {"created_at", nowIso()},
+                                      {"note", a.value("note", std::string{})},
+                                      {"params", params},
+                                      {"budget", {{"max_expert_fraction", maxFrac}}}}.dump();
+            const rn::RuneFile rune{std::move(man), std::move(payloads)};
+            json out = stage(name, "disable_experts", rune.serialize(), params);
+            out["base_fingerprint"] = base;
+            return out;
+        });
+
+    server.addTool(
         "rune_derive_lowrank",
         "7.4.4 adapter ablation: write a new staged LowRank Rune 'name' from the adapters of an "
         "existing LowRank Rune 'source' (staged or committed) — only blocks in 'blocks' (list) or "
