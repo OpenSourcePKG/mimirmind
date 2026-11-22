@@ -40,10 +40,14 @@ __device__ __forceinline__ float dq_e2m1(unsigned nib) {
     // constructing the IEEE-754 bit pattern in registers. Avoids the dynamic
     // index into a local `float mag[8]` array (which lands in local memory =
     // MIO-pipe traffic on the decode-GEMV's short-scoreboard-bound inner loop).
-    // fp32 exp = 126 + (m>>1); mantissa bit = (m&1)<<22; zeroed when m==0.
+    // fp32 exp = 126 + (m>>1); mantissa bit = (m&1)<<22. That formula only
+    // holds for the normal codes m >= 2: E2M1 exponent 0 is subnormal, so
+    // m = 0 -> 0 and m = 1 -> 0.5 (the formula would give 0.5 and 0.75) — a
+    // select covers both, as in moe_gate_up_fused_k_nvfp4tc_batched.cu.
     const unsigned m    = nib & 0x7u;
     const unsigned bits = ((126u + (m >> 1)) << 23) | ((m & 1u) << 22);
-    const float    v    = __uint_as_float(bits) * static_cast<float>(m != 0u);
+    float          v    = __uint_as_float(bits);
+    v = (m < 2u) ? (0.5f * static_cast<float>(m)) : v;
     return (nib & 0x8u) ? -v : v;
 }
 
