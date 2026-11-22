@@ -1334,6 +1334,39 @@ TEST(sharedWeightArena_hugeAlignedCollapseKeepsBytes) {
               static_cast<std::uint32_t>(12345u * 2654435761u));
 }
 
+TEST(sharedWeightArena_collapseClipsToMappingAndPartialTail) {
+    // 5 MiB mapping = two whole 2 MiB pages + a 1 MiB tail that can never be
+    // PMD-mapped: it is skipped, never madvised past the mapping end.
+    const std::uint64_t MiB = 1u << 20;
+    auto a = SharedWeightArena::create("test-huge-tail", 5 * MiB);
+    EXPECT_TRUE(a.has_value());
+    if (!a) return;
+    const auto all = (*a)->collapseHugePages(0, 5 * MiB);
+    EXPECT_EQ(all.collapsedBytes + all.failedBytes, 4 * MiB);
+    EXPECT_EQ(all.skippedBytes, 1 * MiB);
+    // Range inside one huge page widens to that page only.
+    const auto one = (*a)->collapseHugePages(MiB / 2, 4096);
+    EXPECT_EQ(one.collapsedBytes + one.failedBytes, 2 * MiB);
+    EXPECT_EQ(one.skippedBytes, std::uint64_t{0});
+    // Range only in the tail: nothing tried, the (widened) tail is skipped.
+    const auto tail = (*a)->collapseHugePages(4 * MiB + 4096, 8192);
+    EXPECT_EQ(tail.collapsedBytes + tail.failedBytes, std::uint64_t{0});
+    EXPECT_EQ(tail.skippedBytes, 1 * MiB);
+    // Degenerate inputs: no work, no overflow.
+    for (const auto& [off, len] : {std::pair<std::uint64_t, std::uint64_t>{0, 0},
+                                   {5 * MiB, MiB}, {~std::uint64_t{0}, 1}, {MiB, ~std::uint64_t{0}}}) {
+        const auto st = (*a)->collapseHugePages(off, len);
+        EXPECT_TRUE(st.collapsedBytes + st.failedBytes + st.skippedBytes <= 5 * MiB);
+        if (len == 0 || off >= 5 * MiB) {
+            EXPECT_EQ(st.collapsedBytes + st.failedBytes + st.skippedBytes, std::uint64_t{0});
+        }
+    }
+    // Huge `bytes` from offset 1 MiB clips to the mapping: pages 0..1 + tail.
+    const auto big = (*a)->collapseHugePages(MiB, ~std::uint64_t{0});
+    EXPECT_EQ(big.collapsedBytes + big.failedBytes, 4 * MiB);
+    EXPECT_EQ(big.skippedBytes, 1 * MiB);
+}
+
 TEST(weightArenaManifest_roundTrip) {
     const WeightArenaManifest m = sampleManifest();
     auto back = WeightArenaManifest::fromJson(m.toJson());

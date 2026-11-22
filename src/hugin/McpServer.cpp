@@ -3,9 +3,12 @@
 
 #include "hugin/McpServer.hpp"
 
+#include <algorithm>
+#include <array>
 #include <istream>
 #include <ostream>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 namespace mimirmind::hugin {
@@ -14,9 +17,24 @@ namespace {
 
 using nlohmann::json;
 
-/// MCP revision this server implements; echoed back when the client asks
-/// for it, otherwise offered as ours.
-constexpr const char* kProtocolVersion = "2025-06-18";
+/// MCP revisions this server implements, newest first. It only uses
+/// initialize / ping / tools/list / tools/call, which are the same in all
+/// three. Per the MCP lifecycle spec the server answers with the requested
+/// revision when it supports it, otherwise with its newest one (the client
+/// then decides whether to continue); it never confirms a revision it does
+/// not implement.
+constexpr std::array<std::string_view, 3> kProtocolVersions{"2025-06-18", "2025-03-26", "2024-11-05"};
+
+std::string negotiateProtocolVersion(const json& params) {
+    const auto it = params.find("protocolVersion");
+    if (it != params.end() && it->is_string()) {
+        const auto& asked = it->get_ref<const std::string&>();
+        if (std::find(kProtocolVersions.begin(), kProtocolVersions.end(), asked) != kProtocolVersions.end()) {
+            return asked;
+        }
+    }
+    return std::string{kProtocolVersions.front()};
+}
 
 json rpcError(const json& id, int code, const std::string& message) {
     return {{"jsonrpc", "2.0"}, {"id", id}, {"error", {{"code", code}, {"message", message}}}};
@@ -68,8 +86,7 @@ std::optional<json> McpServer::handle(const json& msg) {
     const json  params = msg.contains("params") ? msg["params"] : json::object();
 
     if (method == "initialize") {
-        const std::string asked = params.value("protocolVersion", std::string{kProtocolVersion});
-        return rpcResult(id, {{"protocolVersion", asked},
+        return rpcResult(id, {{"protocolVersion", negotiateProtocolVersion(params)},
                               {"capabilities", {{"tools", json::object()}}},
                               {"serverInfo", {{"name", _name}, {"version", _version}}}});
     }

@@ -44,6 +44,9 @@ public:
     struct CollapseStats {
         std::uint64_t collapsedBytes{0};
         std::uint64_t failedBytes{0};
+        /// Mapped bytes of a trailing partial 2 MiB page (mapping not a
+        /// multiple of 2 MiB): it cannot be PMD-mapped, so it is not tried.
+        std::uint64_t skippedBytes{0};
         int           firstErrno{0};   ///< errno of the first failed range
     };
 
@@ -76,6 +79,9 @@ public:
     /// vs 161 GB/s managed, collapsed they match managed. Holes inside a 2 MiB
     /// range are filled with zero pages. Pinned pages (cudaHostRegister) do not
     /// collapse, so call this before registering. Valid for attach mappings too.
+    /// The widened range is clipped to the mapping (no overflow for any
+    /// offset / bytes; offset >= mapping size or bytes == 0 does nothing), and
+    /// collapsed + failed + skipped == the clipped, widened range.
     [[nodiscard]] CollapseStats collapseHugePages(std::uint64_t offset,
                                                   std::uint64_t bytes) noexcept;
 

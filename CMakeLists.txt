@@ -3763,6 +3763,9 @@ foreach(mm_cpu_test
         probe_config_tests)
     mm_register_test(${mm_cpu_test} cpu)
 endforeach()
+# Hugin (7.x) — CPU-only, in-process MCP tool tests and the backward core.
+mm_register_test(hugin_tests       cpu hugin)
+mm_register_test(hugin_train_tests cpu hugin)
 
 # Accelerator-gated tests — need the matching device present at run time.
 mm_register_test(gpu_tests         l0)

@@ -232,9 +232,20 @@ void SharedWeightArena::deallocate(void* ptr) noexcept {
 SharedWeightArena::CollapseStats
 SharedWeightArena::collapseHugePages(std::uint64_t offset, std::uint64_t bytes) noexcept {
     CollapseStats st;
-    const std::uint64_t h     = kHugePageBytes;
-    const std::uint64_t begin = offset / h * h;
-    const std::uint64_t end   = std::min(_mapBytes, (offset + bytes + h - 1) / h * h);
+    if (bytes == 0 || offset >= _mapBytes) {
+        return st;
+    }
+    const std::uint64_t h       = kHugePageBytes;
+    const std::uint64_t last    = offset + std::min(bytes, _mapBytes - offset);   // <= _mapBytes, no overflow
+    const std::uint64_t begin   = offset / h * h;
+    const std::uint64_t fullEnd = _mapBytes / h * h;                               // end of the last whole huge page
+    // Widen to 2 MiB, then clip: a trailing partial huge page past fullEnd is
+    // not PMD-mappable and madvise over it would run past the mapping.
+    const std::uint64_t end = (last >= fullEnd) ? fullEnd : (last + h - 1) / h * h;
+    if (last > fullEnd) {
+        // Widened, the range then reaches the mapping end (the partial page).
+        st.skippedBytes = _mapBytes - std::max(fullEnd, begin);
+    }
     // One madvise per 2 MiB: madvise_collapse aborts the REST of its range on
     // most failure classes (EINVAL), so a single bad huge page inside a larger
     // call strands everything after it (7.2.4 window: 22.9 of 46.8 GiB with

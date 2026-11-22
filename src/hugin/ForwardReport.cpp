@@ -13,6 +13,26 @@ namespace mimirmind::hugin {
 
 using nlohmann::json;
 
+namespace {
+
+/// Top-k positions of `w` restricted to the attended keys [lo, hi): a key the
+/// sliding window masks has weight 0 by construction and is not an attention
+/// edge, so it must never be listed (also not when k exceeds the window).
+std::vector<std::size_t> topInRange(const std::vector<double>& w, std::size_t lo, std::size_t hi,
+                                    std::size_t k) {
+    std::vector<std::size_t> out;
+    if (lo >= hi) {
+        return out;
+    }
+    const std::span<const double> view(w.data() + lo, hi - lo);
+    for (const auto j : LogitMath::topK(view, k)) {
+        out.push_back(lo + static_cast<std::size_t>(j));
+    }
+    return out;
+}
+
+} // namespace
+
 json ForwardReport::attention(const AttentionStages& s, std::span<const std::int32_t> ids,
                               const Piece& piece, std::uint32_t block, const AttentionOptions& o) {
     if (s.q == nullptr || s.k == nullptr || s.v == nullptr || s.ctx == nullptr) {
@@ -90,9 +110,8 @@ json ForwardReport::attention(const AttentionStages& s, std::span<const std::int
             maxRef = std::max(maxRef, std::fabs(ref));
         }
         json top = json::array();
-        for (const auto j : LogitMath::topK(w, o.topK)) {
-            top.push_back({{"pos", j}, {"token", piece(ids[static_cast<std::size_t>(j)])},
-                           {"weight", w[static_cast<std::size_t>(j)]}});
+        for (const auto j : topInRange(w, kMin, n, o.topK)) {
+            top.push_back({{"pos", j}, {"token", piece(ids[j])}, {"weight", w[j]}});
         }
         json e{{"head", h}, {"kv_head", kvh}, {"entropy", ent}, {"bos_weight", w[0]},
                {"self_weight", w[pos]}, {"top", top}};
@@ -104,9 +123,8 @@ json ForwardReport::attention(const AttentionStages& s, std::span<const std::int
         out.push_back(std::move(e));
     }
     json avgTop = json::array();
-    for (const auto j : LogitMath::topK(avg, o.topK)) {
-        avgTop.push_back({{"pos", j}, {"token", piece(ids[static_cast<std::size_t>(j)])},
-                          {"weight", avg[static_cast<std::size_t>(j)]}});
+    for (const auto j : topInRange(avg, kMin, n, o.topK)) {
+        avgTop.push_back({{"pos", j}, {"token", piece(ids[j])}, {"weight", avg[j]}});
     }
     json res{{"block", block}, {"position", pos}, {"query_token", piece(ids[pos])},
              {"heads", H}, {"kv_heads", Hkv}, {"head_dim", hd}, {"scale", s.scale},

@@ -654,8 +654,9 @@ void InferenceEngine::collapseWeightArena(core::ipc::SharedWeightArena& arena,
     const double secs =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (st.failedBytes == 0) {
-        MM_LOG_INFO("arena", "model '{}': {} MiB collapsed onto 2 MiB pages in {:.1f} s",
-                    _modelIdHint, st.collapsedBytes >> 20, secs);
+        MM_LOG_INFO("arena", "model '{}': {} MiB collapsed onto 2 MiB pages in {:.1f} s "
+                    "({} KiB partial tail stays on 4 KiB pages)",
+                    _modelIdHint, st.collapsedBytes >> 20, secs, st.skippedBytes >> 10);
     } else {
         MM_LOG_WARN("arena",
                     "model '{}': huge-page collapse incomplete — {} MiB collapsed, {} MiB "

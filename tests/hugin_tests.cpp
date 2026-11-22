@@ -146,6 +146,25 @@ TEST(mcp_initialize_and_toolsList) {
                                                    "tensor_stats", "tokenize", "trace"}));
 }
 
+TEST(mcp_initialize_negotiatesProtocolVersion) {
+    // Supported revisions are echoed; anything else gets the newest one we
+    // implement, never the client's string.
+    for (const char* v : {"2025-06-18", "2025-03-26", "2024-11-05"}) {
+        Fixture f;
+        EXPECT_EQ(f.rpc("initialize", {{"protocolVersion", v}})["result"]["protocolVersion"].get<std::string>(),
+                  std::string{v});
+    }
+    for (const json& asked : {json("1999-01-01"), json("2099-12-31"), json(""), json(20250618), json(nullptr)}) {
+        Fixture f;
+        const json r = f.rpc("initialize", {{"protocolVersion", asked}})["result"];
+        EXPECT_EQ(r["protocolVersion"].get<std::string>(), std::string{"2025-06-18"});
+        EXPECT_EQ(r["serverInfo"]["name"].get<std::string>(), std::string{"hugin"});
+    }
+    Fixture f;
+    EXPECT_EQ(f.rpc("initialize", json::object())["result"]["protocolVersion"].get<std::string>(),
+              std::string{"2025-06-18"});
+}
+
 TEST(mcp_protocolErrors) {
     Fixture f;
     EXPECT_EQ(f.rpc("bogus/method")["error"]["code"].get<int>(), -32601);
@@ -417,6 +436,23 @@ TEST(forwardReport_attention_causal_window_span_consistency) {
     const json w = hg::ForwardReport::attention(s, ids, piece, 4, o);
     EXPECT_TRUE(nearD(w["per_head"][1]["bos_weight"].get<double>(), 0.0));
     EXPECT_TRUE(nearD(w["per_head"][1]["entropy"].get<double>(), std::log(2.0)));
+    // top_k larger than the window: only the two attended keys are listed,
+    // never the masked key 0 (weight 0), per head and in the head average.
+    o.topK = 5;
+    const json wk = hg::ForwardReport::attention(s, ids, piece, 4, o);
+    for (const json* tops : {&wk["per_head"][0]["top"], &wk["per_head"][1]["top"], &wk["head_average_top"]}) {
+        EXPECT_EQ(tops->size(), std::size_t{2});
+        for (const auto& t : *tops) {
+            EXPECT_TRUE(t["pos"].get<int>() >= 1);
+            EXPECT_TRUE(t["weight"].get<double>() > 0.0);
+        }
+    }
+    // Head average: head 0 ~1.0 on key 1, head 1 0.5 / 0.5 -> key 1 first.
+    EXPECT_EQ(wk["head_average_top"][0]["pos"].get<int>(), 1);
+    o.topK = 0;
+    const json w0 = hg::ForwardReport::attention(s, ids, piece, 4, o);
+    EXPECT_TRUE(w0["per_head"][0]["top"].empty() && w0["head_average_top"].empty());
+    o.topK = 2;
 
     // Shapes that do not fit the tokens / heads are refused.
     bool threw = false;
