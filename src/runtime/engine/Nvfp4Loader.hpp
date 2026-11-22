@@ -56,6 +56,14 @@ public:
                      std::string_view                     tokenizerGguf,
                      core::safetensors::SafetensorsModel* attachedSm = nullptr);
 
+    /// 7.2.5: after load, move every weight buffer that lives on a pooled
+    /// 512 MiB big block into an exact-size allocation and release all free
+    /// blocks. A reused block otherwise pins the pages of its largest earlier
+    /// tenant (a freed source slab), and free blocks were never returned.
+    /// Rebuilds `_weights` if anything moved. MIMIRMIND_POOL_COMPACT=0 skips
+    /// it (logs the pool state either way). No-op in a non-CUDA build.
+    static void compactAfterLoad(InferenceEngine& engine);
+
     /// 7.2.3 shared-weight attach: read only the checkpoint header (config +
     /// tokenizer) into `engine`, no weights. The weight map comes from the
     /// owner's arena manifest. Kolibri-1 only for now; throws otherwise.

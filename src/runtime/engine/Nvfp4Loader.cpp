@@ -31,11 +31,13 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -53,6 +55,8 @@ void Nvfp4Loader::load(InferenceEngine&, std::string_view, std::string_view,
     throw std::runtime_error("Nvfp4Loader::load: NVFP4 requires the CUDA "
                              "backend (built without MIMIRMIND_ENABLE_CUDA)");
 }
+
+void Nvfp4Loader::compactAfterLoad(InferenceEngine&) {}
 
 void Nvfp4Loader::loadHeaderOnly(InferenceEngine&, std::string_view, std::string_view) {
     throw std::runtime_error("Nvfp4Loader::loadHeaderOnly: NVFP4 requires the CUDA "
@@ -72,13 +76,23 @@ namespace {
 // the blk.7/blk.22 illegal-access ladder). Fix: every big block (expert
 // source slab, expert bank) comes from ONE process-lifetime pool in ONE
 // size class, so a freed source slab physically becomes the next bank.
+// 7.2.5: banks built by buildMoeExpertBanks (FP4-TC) do not come from this
+// pool, so on Kolibri-1 all 150 source slabs ended up free and pinned ~41 GiB
+// for the process lifetime. compactAfterLoad releases free blocks once the load
+// is done; a 2026-11-22 GB10 probe (CUDA 13.3, driver 580) showed cudaFree of
+// managed and device memory returning the pages to the OS, including reuse at
+// a different size.
 constexpr std::size_t kBigBlockMin   = 256ull << 20;
 constexpr std::size_t kBigBlockQuant = 512ull << 20;
 
 struct BigBlockPool {
     std::mutex                          mtx;
     std::vector<void*>                  freeBlocks;   // all kBigBlockQuant
-    std::vector<compute::ComputeBuffer> chunks;       // owned for process life
+    std::vector<compute::ComputeBuffer> chunks;       // owned until trimmed
+    // 7.2.5: block -> bytes of the live view handed out on it. A reused block
+    // keeps the pages its largest earlier tenant touched, so a 300 MiB bank on
+    // a block that held a 480 MiB source slab pins ~180 MiB nobody reads.
+    std::unordered_map<void*, std::size_t> inUse;
 };
 
 BigBlockPool& bigBlockPool() {
@@ -138,15 +152,51 @@ compute::ComputeBuffer bigBlockAlloc(core::cuda::CudaComputeContext& ctx,
         std::lock_guard<std::mutex> g(pool.mtx);
         pool.chunks.push_back(std::move(chunk));
     }
+    {
+        std::lock_guard<std::mutex> g(pool.mtx);
+        pool.inUse[ptr] = bytes;
+    }
     // Non-owning view; the "deleter" returns the block to the pool.
     return compute::ComputeBuffer{
         ptr, bytes,
         [](void* p, std::size_t, void*) noexcept {
             auto& pl = bigBlockPool();
             std::lock_guard<std::mutex> g(pl.mtx);
+            pl.inUse.erase(p);
             pl.freeBlocks.push_back(p);
         },
         nullptr};
+}
+
+/// MemAvailable in MiB (diagnostics only; -1 if unreadable).
+long memAvailableMiB() {
+    std::ifstream f("/proc/meminfo");
+    std::string   key, unit;
+    long          kib = 0;
+    while (f >> key >> kib >> unit) {
+        if (key == "MemAvailable:") {
+            return kib / 1024;
+        }
+    }
+    return -1;
+}
+
+void logBigBlockPool(const char* stage) {
+    auto&         pool = bigBlockPool();
+    std::size_t   chunks = 0, freeN = 0, used = 0;
+    std::uint64_t usedBytes = 0;
+    {
+        std::lock_guard<std::mutex> g(pool.mtx);
+        chunks = pool.chunks.size();
+        freeN  = pool.freeBlocks.size();
+        used   = pool.inUse.size();
+        for (const auto& kv : pool.inUse) usedBytes += kv.second;
+    }
+    MM_LOG_INFO("engine",
+                "big-block pool {}: {} blocks ({} MiB), {} in use holding {} MiB, {} free; "
+                "MemAvailable {} MiB",
+                stage, chunks, (chunks * kBigBlockQuant) >> 20, used, usedBytes >> 20, freeN,
+                memAvailableMiB());
 }
 
 /// DeviceUploader that routes big allocations (the per-expert source slabs)
@@ -442,6 +492,67 @@ void Nvfp4Loader::loadGemma4(InferenceEngine&                     e,
         MM_LOG_INFO("engine",
                     "loadModelNvfp4: gemma4 materialised {} BF16 tensors",
                     e._materializedBf16.size());
+}
+
+void Nvfp4Loader::compactAfterLoad(InferenceEngine& e) {
+    logBigBlockPool("after load");
+    const char* env = std::getenv("MIMIRMIND_POOL_COMPACT");
+    if (env != nullptr && env[0] == '0') {
+        return;   // A/B escape hatch: keep the pool exactly as the load left it
+    }
+    auto& pool = bigBlockPool();
+    auto isPoolView = [&pool](const void* p) {
+        std::lock_guard<std::mutex> g(pool.mtx);
+        return pool.inUse.count(const_cast<void*>(p)) != 0;
+    };
+    auto& cudaCtx = static_cast<core::cuda::CudaComputeContext&>(*e._computeCtx);
+    cudaCtx.stream().synchronize();
+    // 1. Move every pool-backed weight buffer into an exact-size allocation,
+    //    one at a time (peak +1 buffer); its block goes back to the free list.
+    std::size_t   moved = 0;
+    std::uint64_t movedBytes = 0;
+    for (auto& t : e._materializedBf16) {
+        for (compute::ComputeBuffer* buf :
+             {&t.buffer, &t.tcNibbleBank, &t.tcSfbBank, &t.tcGlobalsBank}) {
+            if (buf->get() == nullptr || buf->bytes() == 0 || !isPoolView(buf->get())) {
+                continue;
+            }
+            compute::ComputeBuffer exact = e._ops->allocateWeight(buf->bytes());
+            if (exact.get() == nullptr) {
+                throw std::runtime_error("Nvfp4Loader::compactAfterLoad: allocation failed "
+                                         "for '" + t.ggufName + "'");
+            }
+            cudaCtx.allocator().copyD2D(exact.get(), buf->get(), buf->bytes());
+            movedBytes += buf->bytes();
+            *buf = std::move(exact);   // old view's deleter frees the block to the pool
+            ++moved;
+        }
+    }
+    // 2. Release every free block to the driver (cudaFree returns the pages
+    //    to the OS on GB10 — 7.2.5 probe). Blocks still in use (none for the
+    //    weight map after step 1) stay.
+    std::size_t trimmed = 0;
+    {
+        std::lock_guard<std::mutex> g(pool.mtx);
+        for (void* p : pool.freeBlocks) {
+            auto it = std::find_if(pool.chunks.begin(), pool.chunks.end(),
+                                   [p](const compute::ComputeBuffer& c) { return c.get() == p; });
+            if (it != pool.chunks.end()) {
+                pool.chunks.erase(it);   // ComputeBuffer dtor -> cudaFree
+                ++trimmed;
+            }
+        }
+        pool.freeBlocks.clear();
+    }
+    if (moved > 0) {
+        e._weights.reset();
+        e._weights.emplace(runtime::nvfp4::buildBf16WeightsMap(e._materializedBf16));
+    }
+    MM_LOG_INFO("engine",
+                "big-block pool compacted: {} weight buffer(s) / {} MiB moved to exact-size "
+                "allocations, {} block(s) released (MIMIRMIND_POOL_COMPACT=0 disables)",
+                moved, movedBytes >> 20, trimmed);
+    logBigBlockPool("after compaction");
 }
 
 void Nvfp4Loader::loadKolibri1Header(InferenceEngine&   e,

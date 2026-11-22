@@ -528,6 +528,7 @@ void InferenceEngine::loadModelNvfp4(std::string_view checkpointDir,
         // 7.2.3: nullptr (no sharedWeights) leaves every allocation untouched.
         core::ipc::ScopedWeightArena   _wa{_weightArena.get()};
         engine::Nvfp4Loader::load(*this, checkpointDir, tokenizerGguf);
+        engine::Nvfp4Loader::compactAfterLoad(*this);   // 7.2.5
     }
     if (_weightArena) {
         sealWeightArena();
@@ -826,6 +827,7 @@ void InferenceEngine::loadModelAttachedNvfp4(
     {
         core::gpu::ScopedAllocCategory _wc{core::gpu::AllocCategory::Weights};
         engine::Nvfp4Loader::load(*this, checkpointDir, tokenizerGguf, &sm);
+        engine::Nvfp4Loader::compactAfterLoad(*this);   // 7.2.5
     }
     finalizeLoad();
 #endif // MIMIRMIND_HAVE_CUDA
