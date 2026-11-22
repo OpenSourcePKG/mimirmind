@@ -29,6 +29,8 @@
 #include "runtime/encoder/RerankEngine.hpp"
 
 #include "core/modelopt/BlockScaleSwizzle.hpp" // swizzledBlockScaleBytes / swizzleBlockScale
+#include "core/modelopt/NvFp4Reference.hpp"    // e2m1ToFloat (host reference)
+#include "compute/Dequant.hpp"                // halfToFloat
 #ifdef MIMIRMIND_HAVE_CUTLASS_MOE
 #include "MoeGroupedGemmNvfp4Tc.hpp"          // E-d.3 CUTLASS grouped NVFP4-TC GEMM
 #endif
@@ -46,6 +48,7 @@
 #include <functional>
 #include <map>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -119,6 +122,16 @@ uploadRaw(GpuOps& ops, const std::vector<T>& h) {
     auto buf = ops.allocate(h.size() * sizeof(T));
     ops.uploadHostBytes(buf.get(), h.data(), h.size() * sizeof(T));
     return buf;
+}
+
+// The paged (block-table) attention ops live behind IPagedAttentionOps since
+// the 8.30.6 ISP split; the CUDA backend always provides them.
+::mimirmind::compute::IPagedAttentionOps& pagedOps(GpuOps& ops) {
+    auto* paged = ops.pagedAttentionOps();
+    if (paged == nullptr) {
+        throw std::runtime_error("cuda GpuOps exposes no IPagedAttentionOps");
+    }
+    return *paged;
 }
 
 // Read a device int32 array back to host.
@@ -2687,7 +2700,7 @@ TEST(cuda_paged_attention_prefill_causal_parity) {
     auto dSP  = uploadRaw(ops, startPos);
     auto dOut = ops.allocate(static_cast<std::size_t>(totalTok)*nHeads*headSize*sizeof(float));
 
-    ops.pagedAttentionPrefillCausalAsync(
+    pagedOps(ops).pagedAttentionPrefillCausalAsync(
         static_cast<float*>(dOut.get()), static_cast<const float*>(dQ.get()),
         static_cast<const float*>(dK.get()), static_cast<const float*>(dV.get()),
         static_cast<const std::int32_t*>(dBT.get()),
@@ -2710,7 +2723,7 @@ TEST(cuda_paged_attention_prefill_causal_parity) {
             std::vector<int> sl = {startPos[s] + pq + 1};
             auto dq1 = toDevice(ops, q1); auto dsl = uploadRaw(ops, sl);
             auto do1 = ops.allocate(rowElems*sizeof(float));
-            ops.pagedAttentionDecodeV1Async(
+            pagedOps(ops).pagedAttentionDecodeV1Async(
                 static_cast<float*>(do1.get()), static_cast<const float*>(dq1.get()),
                 static_cast<const float*>(dK.get()), static_cast<const float*>(dV.get()),
                 static_cast<const std::int32_t*>(dBTs.get()),
@@ -2787,7 +2800,7 @@ TEST(cuda_paged_attention_v1_decode_parity) {
     std::vector<int> seqLensV(seqLens, seqLens + nSeq);
     auto dSL  = uploadRaw(ops, seqLensV);
 
-    ops.pagedAttentionDecodeV1Async(
+    pagedOps(ops).pagedAttentionDecodeV1Async(
         static_cast<float*>(dOut.get()),
         static_cast<const float*>(dQ.get()),
         static_cast<const float*>(dK.get()),
@@ -2900,7 +2913,7 @@ TEST(cuda_paged_attention_v2_decode_parity) {
     std::vector<int> seqLensV(seqLens, seqLens + nSeq);
     auto dSL  = uploadRaw(ops, seqLensV);
 
-    ops.pagedAttentionDecodeV2Async(
+    pagedOps(ops).pagedAttentionDecodeV2Async(
         static_cast<float*>(dOut.get()),
         static_cast<const float*>(dQ.get()),
         static_cast<const float*>(dK.get()),
@@ -3465,12 +3478,39 @@ TEST(cuda_nvfp4blk_deint_vec_bw) {
     launchOld(); launchNew(); ops.flush();
     auto yo = fromDevice(ops, dYo.get(), N);
     auto yn = fromDevice(ops, dYn.get(), N);
-    double maxRel = 0.0;
-    for (int i = 0; i < N; ++i) {
-        const double denom = std::max(1e-3, std::fabs(static_cast<double>(yo[i])));
-        maxRel = std::max(maxRel, std::fabs(static_cast<double>(yn[i] - yo[i])) / denom);
-        EXPECT_NEAR(yn[i], yo[i], 1e-2f * (1.0f + std::fabs(yo[i])));
+
+    // Double-precision host reference of the same 20-byte blocks (fp16 scale
+    // per 16 values, e2m1 nibbles low-first), so each kernel is judged on its
+    // own instead of against the other one.
+    std::vector<double> ref(N, 0.0);
+    for (int n = 0; n < N; ++n) {
+        double acc = 0.0;
+        for (int s = 0; s < nSuper; ++s) {
+            const unsigned char* p = &W[(static_cast<std::size_t>(n) * nSuper + s) * kNvSuperBytes];
+            std::uint16_t h0 = 0, h1 = 0;
+            std::memcpy(&h0, p, 2);
+            std::memcpy(&h1, p + 2, 2);
+            const double s0 = ::mimirmind::compute::halfToFloat(h0);
+            const double s1 = ::mimirmind::compute::halfToFloat(h1);
+            for (int j = 0; j < 16; ++j) {
+                const double sc = j < 8 ? s0 : s1;
+                const int k0 = s * 32 + 2 * j;
+                acc += sc * ::mimirmind::core::modelopt::e2m1ToFloat(p[4 + j] & 0x0F) * X[k0];
+                acc += sc * ::mimirmind::core::modelopt::e2m1ToFloat(p[4 + j] >> 4) * X[k0 + 1];
+            }
+        }
+        ref[n] = acc;
     }
+    double maxRel = 0.0, maxRelOld = 0.0;
+    for (int i = 0; i < N; ++i) {
+        const double denom = std::max(1e-3, std::fabs(ref[i]));
+        maxRel    = std::max(maxRel,    std::fabs(static_cast<double>(yn[i]) - ref[i]) / denom);
+        maxRelOld = std::max(maxRelOld, std::fabs(static_cast<double>(yo[i]) - ref[i]) / denom);
+        EXPECT_NEAR(yn[i], static_cast<float>(ref[i]), 1e-2f * (1.0f + std::fabs(static_cast<float>(ref[i]))));
+        EXPECT_NEAR(yo[i], static_cast<float>(ref[i]), 1e-2f * (1.0f + std::fabs(static_cast<float>(ref[i]))));
+    }
+    std::printf("[nvfp4-deint-vec] vs double reference: NEW maxRel=%.2e OLD maxRel=%.2e\n",
+                maxRel, maxRelOld);
 
     constexpr int ITERS = 2000;
     const double bytes = static_cast<double>(N) * K * 0.625;   // NVFP4 weight bytes
