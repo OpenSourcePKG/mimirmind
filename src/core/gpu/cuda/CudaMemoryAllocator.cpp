@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #ifdef __linux__
 #include <execinfo.h>   // 8.16 (a) untagged-alloc backtrace finder (temporary)
@@ -173,6 +174,22 @@ void* CudaMemoryAllocator::allocate(std::size_t bytes, CudaAllocKind kind) {
     if (rc != cudaSuccess) {
         _stats.failedAllocs += 1;
         throw CudaError(std::string("cuda alloc (") + kindName(kind) + ")", rc);
+    }
+    // 7.8 debug: fill every fresh buffer with 0xFF bytes (NaN as f32 / bf16 /
+    // fp16, -1 as int32) so a kernel that reads scratch before writing it
+    // fails deterministically instead of depending on what the freed pages
+    // held. Off unless MIMIRMIND_POISON_ALLOC=1; never used by serving.
+    static const bool poison = [] {
+        const char* v = std::getenv("MIMIRMIND_POISON_ALLOC");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (poison) {
+        if (kind == CudaAllocKind::HostPinned) {
+            std::memset(ptr, 0xFF, bytes);
+        } else {
+            cudaCheck("poison cudaMemset", cudaMemset(ptr, 0xFF, bytes));
+            cudaCheck("poison sync", cudaDeviceSynchronize());
+        }
     }
     recordAlloc(bytes);
     chargeCategory(ptr, bytes);

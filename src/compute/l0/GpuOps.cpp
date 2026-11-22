@@ -691,6 +691,10 @@ void GpuOps::siluMulAsync(float*       gate,
                         groupsForN(n, kElementwiseLocalSize), 1, 1);
 }
 
+void GpuOps::zeroAsync(float* y, std::size_t n) {
+    _queue.appendMemoryZero(y, n * sizeof(float));
+}
+
 void GpuOps::mulScalarAsync(float*       y,
                             float        s,
                             std::size_t  n) {

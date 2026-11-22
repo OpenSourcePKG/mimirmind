@@ -138,6 +138,7 @@ public:
                               std::size_t hidden, std::size_t posOffset) override;
 
     void mulScalarAsync(float* y, float s, std::size_t n) override;
+    void zeroAsync(float* y, std::size_t n) override;
 
     void scaledAddResidualAsync(float* dst, const float* src,
                                 float scale, std::size_t n) override;

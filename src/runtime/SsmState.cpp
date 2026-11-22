@@ -22,10 +22,8 @@ SsmState::SsmState(compute::ComputeOps& ops,
 }
 
 void SsmState::reset(compute::ComputeOps& ops) {
-    ops.mulScalarAsync(_state.as<float>(), 0.0F,
-                       _blockCount * _nSeq * _stateElems);
-    ops.mulScalarAsync(_convState.as<float>(), 0.0F,
-                       _blockCount * _nSeq * _convStateElems);
+    ops.zeroAsync(_state.as<float>(), _blockCount * _nSeq * _stateElems);
+    ops.zeroAsync(_convState.as<float>(), _blockCount * _nSeq * _convStateElems);
 }
 
 } // namespace mimirmind::runtime

@@ -260,7 +260,7 @@ void Gemma4MoeBackend::runFfnMoeSection(std::size_t   blockIdx,
 
     _op.mark(runtime::OpProfiler::Cat::RESIDUAL);
     trace("path B: zero accumulator");
-    _ops.mulScalarAsync(moeAccumBuf, 0.0F, T * d_model);
+    _ops.zeroAsync(moeAccumBuf, T * d_model);
 
     const std::size_t gateUpFused = expGateUp->dimensions.size() >= 2
                                       ? expGateUp->dimensions[1] : 0;
@@ -382,7 +382,7 @@ void Gemma4MoeBackend::runFfnMoeSection(std::size_t   blockIdx,
                             (nExperts + 1) * sizeof(std::int32_t));
 
         // Zero the accumulator (the scatter sums each token's K rows in).
-        _ops.mulScalarAsync(moeAccumBuf, 0.0F, T * d_model);
+        _ops.zeroAsync(moeAccumBuf, T * d_model);
 
         _ops.profileSection("g4.moe.gemm");   // MIMIRMIND_DECODE_PROFILE section
         trace("path B (device-grouped): per-expert batched matmuls");

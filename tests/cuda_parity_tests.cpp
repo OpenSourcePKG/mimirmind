@@ -1028,7 +1028,7 @@ TEST(cuda_moe_down_fused_k_q5k_parity) {
     auto refAcc  = ops.allocate(dModel * sizeof(float));
     auto expOut  = ops.allocate(dModel * sizeof(float));
     auto scratch = ops.allocate(std::max(dModel, nFf) * sizeof(float));
-    ops.mulScalarAsync(static_cast<float*>(refAcc.get()), 0.0f, dModel);
+    ops.zeroAsync(static_cast<float*>(refAcc.get()), dModel);
     const auto* downBase = static_cast<const std::uint8_t*>(downBank.get());
     for (std::size_t k = 0; k < K; ++k) {
         const std::size_t e = static_cast<std::size_t>(expIdx[k]);
@@ -1045,7 +1045,7 @@ TEST(cuda_moe_down_fused_k_q5k_parity) {
 
     // Fused: one launch for all K down-GEMVs + router-weighted residual add.
     auto gotAcc = ops.allocate(dModel * sizeof(float));
-    ops.mulScalarAsync(static_cast<float*>(gotAcc.get()), 0.0f, dModel);
+    ops.zeroAsync(static_cast<float*>(gotAcc.get()), dModel);
     gmm.moeDownFusedKAsync(Q5K, static_cast<const float*>(gateAct.get()),
                            downBank.get(),
                            static_cast<const std::int32_t*>(dExpIdx.get()),
@@ -2319,7 +2319,7 @@ TEST(cuda_moe_down_fused_k_q5k_batched_parity) {
 
     // Batched: accum[nSeq, dModel] seeded to 0, one launch.
     auto gotAcc = ops.allocate(nSeq * dModel * sizeof(float));
-    ops.mulScalarAsync(static_cast<float*>(gotAcc.get()), 0.0f, nSeq * dModel);
+    ops.zeroAsync(static_cast<float*>(gotAcc.get()), nSeq * dModel);
     gmm.moeDownFusedKBatchedAsync(Q5K, static_cast<const float*>(dGA.get()),
         downBank.get(), static_cast<const std::int32_t*>(dEI.get()),
         static_cast<const float*>(dKW.get()),
@@ -2338,7 +2338,7 @@ TEST(cuda_moe_down_fused_k_q5k_batched_parity) {
         auto dei = uploadRaw(ops, ei);
         auto dkw = uploadRaw(ops, kw);
         auto refAcc = ops.allocate(dModel * sizeof(float));
-        ops.mulScalarAsync(static_cast<float*>(refAcc.get()), 0.0f, dModel);
+        ops.zeroAsync(static_cast<float*>(refAcc.get()), dModel);
         gmm.moeDownFusedKAsync(Q5K, static_cast<const float*>(dga.get()),
             downBank.get(), static_cast<const std::int32_t*>(dei.get()),
             static_cast<const float*>(dkw.get()),

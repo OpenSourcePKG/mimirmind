@@ -242,6 +242,10 @@ void GpuOps::mulScalarAsync(float*       y,
     }
 }
 
+void GpuOps::zeroAsync(float* y, std::size_t n) {
+    std::fill(y, y + n, 0.0F);
+}
+
 void GpuOps::scaledAddResidualAsync(float*       dst,
                                     const float* src,
                                     float        scale,

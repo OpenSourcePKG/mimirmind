@@ -112,6 +112,7 @@ public:
     void mulScalarAsync(float*       y,
                         float        s,
                         std::size_t  n) override;
+    void zeroAsync(float* y, std::size_t n) override;
 
     void scaledAddResidualAsync(float*       dst,
                                 const float* src,

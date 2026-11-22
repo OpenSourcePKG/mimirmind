@@ -549,7 +549,7 @@ void Qwen3_5MoeBackend::runMoeFfn(std::size_t   blockIdx,
     const core::gguf::GgmlType upType   = upSrc.type;
 
     // --- zero the accumulator ----------------------------------------
-    _ops.mulScalarAsync(moeAccumBuf, 0.0F, T * d_model);
+    _ops.zeroAsync(moeAccumBuf, T * d_model);
 
     // --- routed experts ----------------------------------------------
     // M-Q3N.4 MoE-Expert-Grouping (decode). At T==1 the down-projections
@@ -606,7 +606,7 @@ void Qwen3_5MoeBackend::runMoeFfn(std::size_t   blockIdx,
                 static_cast<const float*>(gateSrc.tcGlobalsPtr),
                 static_cast<const float*>(upSrc.tcGlobalsPtr),
                 expIdxSlot, gateActAll, 1, d_model, n_ff_exp, K, sfbGu);
-            _ops.mulScalarAsync(moeAccumBuf, 0.0F, d_model);
+            _ops.zeroAsync(moeAccumBuf, d_model);
             _gmm.moeDownFusedKTcBatchedAsync(
                 gateActAll, downExps.tcNibblePtr, downExps.tcSfbPtr,
                 static_cast<const float*>(downExps.tcGlobalsPtr),
@@ -941,7 +941,7 @@ void Qwen3_5MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
             static_cast<const float*>(gateExps.tcGlobalsPtr),
             static_cast<const float*>(upExps.tcGlobalsPtr),
             expIdxSlot, gateActAll, nSeq, d_model, n_ff_exp, K, sfbGu);
-        _ops.mulScalarAsync(moeAccumBuf, 0.0F, nSeq * d_model);
+        _ops.zeroAsync(moeAccumBuf, nSeq * d_model);
         _gmm.moeDownFusedKTcBatchedAsync(
             gateActAll, downExps.tcNibblePtr, downExps.tcSfbPtr,
             static_cast<const float*>(downExps.tcGlobalsPtr),
@@ -950,7 +950,7 @@ void Qwen3_5MoeBackend::runMoeFfnBatched(std::size_t    blockIdx,
         _gmm.moeGateUpFusedKBatchedAsync(gateExps.type, moeInput, gateBase, upBase,
                                          expIdxSlot, gateActAll, nSeq,
                                          d_model, n_ff_exp, K, bytesGate, bytesUp);
-        _ops.mulScalarAsync(moeAccumBuf, 0.0F, nSeq * d_model);
+        _ops.zeroAsync(moeAccumBuf, nSeq * d_model);
         _gmm.moeDownFusedKBatchedAsync(downExps.type, gateActAll, downBase,
                                        expIdxSlot, kwSlot, moeAccumBuf, nSeq,
                                        n_ff_exp, d_model, K, bytesDown);
@@ -1898,7 +1898,7 @@ void Qwen3_5MoeBackend::runGdnRecurrence(
         const bool frozen = ctx.activeMaskHost != nullptr
                             && ctx.activeMaskHost[seq] == 0;
         if (!frozen && ctx.isSeqStart != nullptr && ctx.isSeqStart[seq] != 0) {
-            _ops.mulScalarAsync(stateBase + seq * stateElems, 0.0F, stateElems);
+            _ops.zeroAsync(stateBase + seq * stateElems, stateElems);
         }
     }
     // 5.21-III ragged: per-slot seqT/seqOff drive the recurrence (T fallback =
@@ -2012,8 +2012,7 @@ void Qwen3_5MoeBackend::runGdnConvAndSplit(const BatchedDecodeCtx& ctx,
             const bool frozen = ctx.activeMaskHost != nullptr
                                 && ctx.activeMaskHost[seq] == 0;
             if (!frozen && ctx.isSeqStart != nullptr && ctx.isSeqStart[seq] != 0) {
-                _ops.mulScalarAsync(convBase + seq * convStateElems, 0.0F,
-                                    convStateElems);
+                _ops.zeroAsync(convBase + seq * convStateElems, convStateElems);
             }
         }
         _ops.gdnConvPackBatchedAsync(
@@ -2034,7 +2033,7 @@ void Qwen3_5MoeBackend::runGdnConvAndSplit(const BatchedDecodeCtx& ctx,
             const bool frozen = ctx.activeMaskHost != nullptr
                                 && ctx.activeMaskHost[seq] == 0;
             if (!frozen && ctx.isSeqStart != nullptr && ctx.isSeqStart[seq] != 0) {
-                _ops.mulScalarAsync(cvState, 0.0F, convStateElems);
+                _ops.zeroAsync(cvState, convStateElems);
             }
             _ops.appendMemoryCopy(cvIn, cvState, convInBytes);
             _ops.appendMemoryCopy(cvIn + stateRows * convDim,
@@ -2465,7 +2464,7 @@ void Qwen3_5MoeBackend::runLinearBlockVerify(
             float* const cvState = convBase + seq * convStateElems;
             float* const cvIn    = convInput + seq * dConv * convDim;
             if (seqStartJ[seq] != 0) {
-                _ops.mulScalarAsync(cvState, 0.0F, convStateElems);
+                _ops.zeroAsync(cvState, convStateElems);
             }
             _ops.appendMemoryCopy(cvIn, cvState, convInBytes);
             _ops.appendMemoryCopy(cvIn + stateRows * convDim,
@@ -2502,7 +2501,7 @@ void Qwen3_5MoeBackend::runLinearBlockVerify(
     // maps to the fused kernel's stateIn. Reset S_0 for any such slot.
     for (std::size_t seq = 0; seq < N; ++seq) {
         if (gdnSeqStart[seq] != 0) {
-            _ops.mulScalarAsync(stateBase + seq * stateElems, 0.0F, stateElems);
+            _ops.zeroAsync(stateBase + seq * stateElems, stateElems);
         }
     }
 

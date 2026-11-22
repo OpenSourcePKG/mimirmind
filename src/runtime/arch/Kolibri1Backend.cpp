@@ -394,7 +394,7 @@ void Kolibri1Backend::runKolibriMoe(std::size_t blockIdx, const float* din,
         tapStageHost("moe_topk_w", blockIdx, _selW.data(), T, K);
     }
 
-    _ops.mulScalarAsync(moeAccum, 0.0F, T * d_model);
+    _ops.zeroAsync(moeAccum, T * d_model);
 
     if (gExps.type == core::gguf::GgmlType::NVFP4_TC) {
         // --- routed experts, FP4-tensor-core fused-K (I-9 / 5.34.10) --------

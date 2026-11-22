@@ -762,6 +762,17 @@ void GpuOps::mulScalarAsync(float* y, float s, std::size_t n) {
              kElementwiseLocalSize, 1, 1);
 }
 
+void GpuOps::zeroAsync(float* y, std::size_t n) {
+    if (n == 0) {
+        return;
+    }
+    const hipError_t rc = hipMemsetAsync(y, 0, n * sizeof(float), _ctx.stream().handle());
+    if (rc != hipSuccess) {
+        throw std::runtime_error(std::string{"compute::hip::GpuOps::zeroAsync: hipMemsetAsync failed: "} +
+                                 hipGetErrorString(rc));
+    }
+}
+
 void GpuOps::scaledAddResidualAsync(float* dst, const float* src,
                                     float scale, std::size_t n) {
     if (n == 0) {

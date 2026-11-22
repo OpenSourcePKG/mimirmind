@@ -308,6 +308,7 @@ public:
     void mulScalarAsync(float*       y,
                         float        s,
                         std::size_t  n) override;
+    void zeroAsync(float* y, std::size_t n) override;
 
     /// GELU-flavoured SwiGLU: gate[i] = gelu_tanh(gate[i]) * up[i].
     /// Used by Gemma 4's FFN paths (vs Qwen's siluMulAsync).

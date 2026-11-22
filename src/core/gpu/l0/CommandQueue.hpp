@@ -110,6 +110,10 @@ public:
                           const void* src,
                           std::size_t nBytes);
 
+    /// Append a device-side zero fill of `nBytes` at `dst` (same ordering,
+    /// barrier and replay semantics as appendMemoryCopy).
+    void appendMemoryZero(void* dst, std::size_t nBytes);
+
     /// Test helper / sanity probe.
     [[nodiscard]] std::uint32_t unorderedDepth() const noexcept { return _unorderedDepth; }
 

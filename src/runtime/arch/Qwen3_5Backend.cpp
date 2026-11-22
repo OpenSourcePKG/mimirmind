@@ -739,7 +739,7 @@ void Qwen3_5Backend::runLinearBlock(std::size_t   blockIdx,
     trace("conv1d (rolling state-concat + silu)");
     const std::size_t stateRows = (dConv > 0 ? dConv - 1 : 0);
     if (isSeqStart) {
-        _ops.mulScalarAsync(convState, 0.0F, convStateElems);
+        _ops.zeroAsync(convState, convStateElems);
     }
     // conv_input = [conv_state | qkv_mixed]
     _ops.appendMemoryCopy(convInput, convState,
@@ -790,7 +790,7 @@ void Qwen3_5Backend::runLinearBlock(std::size_t   blockIdx,
     _ops.profileSection("gdn.recur");   // prefill GDN sub-split (delta-rule chunk/AR)
     trace("delta-rule recurrence");
     if (isSeqStart) {
-        _ops.mulScalarAsync(stateBuf, 0.0F, stateElems);
+        _ops.zeroAsync(stateBuf, stateElems);
     }
     if (T > 1 && T >= _gdnChunkMinT) {
         // Chunked prefill: K0 (cumgate) -> K1 (kkt inverse) -> K2 (forward).

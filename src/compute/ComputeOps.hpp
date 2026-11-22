@@ -222,6 +222,12 @@ public:
                                 float        s,
                                 std::size_t  n) = 0;
 
+    /// y[0..n) = 0, as a device memory fill on the queue (graph-capturable).
+    /// Use this, not mulScalarAsync(y, 0): 0 * NaN and 0 * Inf are NaN, so
+    /// multiplying by zero does not clear a buffer that holds a NaN/Inf bit
+    /// pattern (recycled device memory, a poisoned serving slot) (7.8).
+    virtual void zeroAsync(float* y, std::size_t n) = 0;
+
     virtual void scaledAddResidualAsync(float*       dst,
                                         const float* src,
                                         float        scale,
