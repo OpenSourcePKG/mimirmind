@@ -242,7 +242,8 @@ ModelEntry parseModel(std::string_view      path,
     }
     checkKnownKeys(path, section, j,
                    {"id", "title", "path", "format", "tokenizerGguf", "codec",
-                    "headsDir", "runes", "loadOnStart", "runtime", "backend", "task"});
+                    "headsDir", "runes", "sharedWeights", "loadOnStart", "runtime", "backend",
+                    "task"});
 
     ModelEntry m{};
     if (!j.contains("id") || !j["id"].is_string() || j["id"].get<std::string>().empty()) {
@@ -283,6 +284,24 @@ ModelEntry parseModel(std::string_view      path,
             }
             m.runes.push_back(r.get<std::string>());
         }
+    }
+    if (j.contains("sharedWeights")) {
+        const auto& sj = j["sharedWeights"];
+        const std::string ss = section + ".sharedWeights";
+        if (!sj.is_object()) {
+            fail(path, ss + " must be an object");
+        }
+        checkKnownKeys(path, ss, sj, {"socket", "hostRegister"});
+        ModelEntry::SharedWeights sw{};
+        if (!sj.contains("socket") || !sj["socket"].is_string() ||
+            sj["socket"].get<std::string>().empty()) {
+            fail(path, ss + ".socket is required (non-empty string)");
+        }
+        sw.socket = sj["socket"].get<std::string>();
+        if (const auto v = readOpt<bool>(path, ss, sj, "hostRegister"); v.has_value()) {
+            sw.hostRegister = *v;
+        }
+        m.sharedWeights = std::move(sw);
     }
     if (const auto v = readOpt<std::string>(path, section, j, "task"); v.has_value()) {
         const auto t = modelTaskFromString(*v);

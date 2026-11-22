@@ -105,6 +105,15 @@ struct ModelEntry {
     // not apply cleanly fails the load. The base model file is never modified —
     // remove the entry to get the unmodified model back.
     std::vector<std::string> runes{};
+    // 7.2.3: publish this model's materialized weights to attachers (Hugin)
+    // from a memfd arena on a Unix socket. Absent = off (weights stay in
+    // cudaMallocManaged exactly as before). NVFP4 checkpoints on a
+    // pageableMemoryAccess CUDA device (GB10) only.
+    struct SharedWeights {
+        std::string socket{};          // Unix socket path the arena is served on
+        bool        hostRegister{false};
+    };
+    std::optional<SharedWeights> sharedWeights{};
     bool              loadOnStart{true};
     RuntimeSettings   runtime{};         // per-model override, merged onto top-level
 

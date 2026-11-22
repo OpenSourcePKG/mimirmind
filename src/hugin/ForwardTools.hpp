@@ -84,6 +84,19 @@ public:
     /// returned by engine() / engineWithRunes() are invalidated by the next
     /// call to the other one.
     void setSingleEngine(bool on) noexcept { _singleEngine = on; }
+
+    /// 7.2.3: build every engine on the live serving engine's weights instead
+    /// of loading the checkpoint — connect to the engine's `sharedWeights`
+    /// socket, map its arena read-only, bind (no copy). Base and rune variant
+    /// both attach, so a variant costs only its overlays. Refuses to attach
+    /// when MemAvailable is below `minFreeGiB` (Hugin's own working set —
+    /// KV, scratch, derived copies — must fit beside serving). Empty socket =
+    /// standalone load (default).
+    void setAttach(std::string socket, double minFreeGiB) {
+        _attachSocket = std::move(socket);
+        _attachMinFreeGiB = minFreeGiB;
+    }
+    [[nodiscard]] const std::string& attachSocket() const noexcept { return _attachSocket; }
     [[nodiscard]] bool singleEngine() const noexcept { return _singleEngine; }
 
     /// Identity of the current target (path + tokenizer); session state that
@@ -104,6 +117,8 @@ private:
     std::unique_ptr<Loaded>      _base;
     std::unique_ptr<Loaded>      _variant;
     bool                         _singleEngine{false};
+    std::string                  _attachSocket;
+    double                       _attachMinFreeGiB{8.0};
 };
 
 } // namespace mimirmind::hugin

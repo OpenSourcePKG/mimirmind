@@ -59,6 +59,8 @@ wie Llama 3.2 1B).
 hugin [--model <file.gguf | nvfp4-checkpoint-dir>] [--tokenizer-gguf <file.gguf>]
       [--rune-dir <dir>]      staged/committed/rejected Runes + Audit-Log (Default ./runes)
       [--single-engine]       Basis ODER Rune-Variante halten, nie beide
+      [--attach <socket>]     auf den Gewichten der laufenden Engine arbeiten (nur lesend, keine Kopie)
+      [--attach-min-free-gib <n>]  Attach unter n GiB MemAvailable ablehnen (Default 8)
 ```
 
 - `--single-engine` ist für Modelle, die nicht zweimal in den Speicher
@@ -66,8 +68,39 @@ hugin [--model <file.gguf | nvfp4-checkpoint-dir>] [--tokenizer-gguf <file.gguf>
   auf allen Sets aus und laden die Variante einmal.
 - Unter CUDA Hugin mit der Serving-Umgebung des Modells starten
   (`MIMIRMIND_*`-Flags), damit der Forward dem Produktivbetrieb entspricht.
-- Auf GB10 immer nur ein GPU-Prozess: vor einer GPU-Hugin-Session das
-  Serving stoppen.
+- Standalone lädt Hugin eine eigene Kopie des Modells. Für ein großes
+  Modell passt das auf GB10 nicht neben das Serving (Kolibri-1: ~82 GiB),
+  also vorher das Serving stoppen oder sich anhängen (unten).
+
+### An die laufende Engine anhängen (7.2.3)
+
+Das Modell bekommt in der Serving-Config einen `sharedWeights`-Eintrag:
+
+```json
+{ "id": "kolibri1", "sharedWeights": { "socket": "/run/mimirmind/kolibri1.sock" } }
+```
+
+Die Engine lädt die Gewichte dieses Modells dann in eine memfd-Arena statt
+in `cudaMallocManaged` und stellt die Arena nur lesend am Socket bereit.
+Hugin mit `--attach <socket>` starten (der Socket-Pfad muss in beiden
+Containern sichtbar sein) und mit demselben `--model`-Checkpoint: Hugin
+empfängt das Manifest, prüft den Checkpoint-Fingerprint, mappt die Gewichte
+nur lesend und bindet seine Engines daran. Basis und Rune-Variante hängen
+sich beide an, eine Variante kostet also nur ihre Overlays.
+
+- NVFP4-Checkpoints auf einem CUDA-Gerät mit `pageableMemoryAccess` (GB10);
+  vorerst nur Kolibri-1 (Attach braucht pro Architektur ein Laden nur des
+  Headers).
+- Nur lesend: Overlay-Runes (lowrank, steer, expert mask) funktionieren;
+  eine Rune, die Basis-Bytes überschreibt, lässt das Attach-Laden
+  scheitern. Hugin lehnt eine Engine ab, deren Basis eine Rune überschrieben
+  hat.
+- Gemessen auf GB10 / Kolibri-1 (2026-11-22): Hugin-Ergebnisse bit-identisch
+  zu einer Standalone-Session; erster Aufruf 9 s statt 208 s; ~10 GiB extra
+  für Basis + Variante statt ~82 GiB; Serving unter Last unbeeinflusst
+  (96/96). Die Arena kostet das Serving ~5 % Decode bei 1 Stream und ~2 %
+  bei 8 Streams, `hostRegister: true` ändert daran nichts. `sharedWeights`
+  für Hugin-Sessions einschalten, nicht als Serving-Default.
 
 In Claude Code registrieren:
 
@@ -354,8 +387,10 @@ reproduzierten die Preview-Texte exakt (4/4 und 2/2).
   Gewichte), CUDA-Build nötig.
 - `generate` ist zustandslos und langsam; `steer_if_preview` und
   Generate-Items in `eval` nutzen den KV-gecachten Serving-Decode.
-- Auf GB10 immer nur ein GPU-Prozess; Hugin-Sessions auf einem großen
-  Modell brauchen ein Wartungsfenster.
+- Eine Standalone-Hugin-Session auf einem großen Modell braucht auf GB10
+  ein Wartungsfenster; angehängt (`--attach`) läuft sie im Speicherbudget
+  neben dem Serving. Training (7.4) auf angehängten Gewichten ist noch
+  nicht validiert.
 - Die Prompts, aus denen Steer- und Bedingungsvektoren gefittet werden,
   disjunkt zu den Gate-Goldsets halten, und in beiden Klassen einer
   Bedingung dieselben Fragen nutzen (nur die geprüfte Eigenschaft darf

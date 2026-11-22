@@ -23,13 +23,16 @@
 
 namespace {
 
-constexpr const char* kVersion = "0.7.0";
+constexpr const char* kVersion = "0.8.0";
 
 void usage() {
     std::cerr << "usage: hugin [--model <file.gguf | nvfp4-checkpoint-dir>] [--tokenizer-gguf <file.gguf>]\n"
                  "             [--rune-dir <dir>]   (staged/committed/rejected runes + audit; default ./runes)\n"
                  "             [--single-engine]    (hold base OR rune variant, never both: models too large\n"
                  "                                   for two resident copies; each switch reloads)\n"
+                 "             [--attach <socket>]  (run on the live engine's weights: its models[].sharedWeights\n"
+                 "                                   socket; read-only, no second copy)\n"
+                 "             [--attach-min-free-gib <n>] (refuse to attach below n GiB MemAvailable; default 8)\n"
                  "  Runs an MCP server on stdin/stdout (newline-delimited JSON-RPC 2.0).\n"
                  "  Register with Claude Code, e.g.:\n"
                  "    claude mcp add hugin -- /path/to/hugin --model /path/to/model.gguf\n";
@@ -42,6 +45,8 @@ int main(int argc, char** argv) {
     std::string tokenizerGguf;
     std::string runeDir = "runes";
     bool        singleEngine = false;
+    std::string attachSocket;
+    double      attachMinFreeGiB = 8.0;
     for (int i = 1; i < argc; ++i) {
         const std::string_view a = argv[i];
         if (a == "--model" && i + 1 < argc) {
@@ -52,6 +57,10 @@ int main(int argc, char** argv) {
             runeDir = argv[++i];
         } else if (a == "--single-engine") {
             singleEngine = true;
+        } else if (a == "--attach" && i + 1 < argc) {
+            attachSocket = argv[++i];
+        } else if (a == "--attach-min-free-gib" && i + 1 < argc) {
+            attachMinFreeGiB = std::stod(argv[++i]);
         } else if (a == "--help" || a == "-h") {
             usage();
             return 0;
@@ -84,6 +93,7 @@ int main(int argc, char** argv) {
             return mimirmind::hugin::ForwardTools::Target{inspect.modelPath(), inspect.tokenizerGguf()};
         }};
         forwardTools.setSingleEngine(singleEngine);
+        forwardTools.setAttach(attachSocket, attachMinFreeGiB);
         mimirmind::hugin::SurgeryTools surgery{forwardTools};
         mimirmind::hugin::RuneStaging  staging{forwardTools, surgery, runeDir, kVersion};
         mimirmind::hugin::TrainTools   training{forwardTools, staging};

@@ -47,16 +47,20 @@
 #include "compute/cuda/GpuOps.hpp"
 #include "compute/cuda/CudaMaterializerOps.hpp"
 #include "core/gpu/cuda/CudaComputeContext.hpp"
+#include <cuda_runtime.h>
 #include "core/modelopt/HfQuantConfig.hpp"
 #include "core/modelopt/Qwen3_5MoeMaterializer.hpp"
 #include "core/safetensors/SafetensorsModel.hpp"
 #include "runtime/nvfp4/ComputeOpsUploader.hpp"
 #include "runtime/nvfp4/NvFp4WeightsMap.hpp"
+#include "runtime/nvfp4/SharedArenaWeights.hpp"
 #include "runtime/nvfp4/PleNgramTable.hpp"
 #include "runtime/nvfp4/Qwen3_5MoeConfig.hpp"
 #include <filesystem>
 #include <sstream>
 #endif
+
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -454,6 +458,10 @@ void InferenceEngine::loadModel(std::string_view ggufPath) {
     if (_modelLoaded) {
         throw std::runtime_error("InferenceEngine: model already loaded");
     }
+    if (_sharedExport) {
+        throw std::runtime_error("sharedWeights is supported for NVFP4 checkpoints "
+                                 "only (GGUF load of '" + std::string{ggufPath} + "')");
+    }
 
     MM_LOG_INFO("engine", "loadModel: opening '{}'", ggufPath);
     _reader.open(ggufPath);
@@ -507,18 +515,186 @@ void InferenceEngine::loadModelNvfp4(std::string_view checkpointDir,
         _runeBaseFingerprint = core::safetensors::checkpointFingerprint(checkpointDir);
     }
     applyEarlyLoaderProfileFlags();
+    const std::vector<std::string> runesForLoad = _runePaths;
+    if (_sharedExport) {
+        beginWeightArena();
+    }
     // The NVFP4 checkpoint load pipeline lives in engine::Nvfp4Loader (a friend
     // collaborator) to keep this translation unit focused on generation. It
     // populates _config / _tokenizer / _materializedBf16 / _weights; we run the
     // shared finalize tail here.
     {
         core::gpu::ScopedAllocCategory _wc{core::gpu::AllocCategory::Weights};
+        // 7.2.3: nullptr (no sharedWeights) leaves every allocation untouched.
+        core::ipc::ScopedWeightArena   _wa{_weightArena.get()};
         engine::Nvfp4Loader::load(*this, checkpointDir, tokenizerGguf);
+    }
+    if (_weightArena) {
+        sealWeightArena();
     }
     // 5.27 I-4: remember the checkpoint dir so finalizeLoad can host-mmap the
     // off-VRAM PLE n-gram table for qwen4_exp (NVFP4-load path only).
     _pleCheckpointDir = std::string{checkpointDir};
     finalizeLoad();
+    if (_weightArena) {
+        publishWeightArena(checkpointDir, runesForLoad);
+    }
+}
+
+void InferenceEngine::loadModelSharedArena(std::string_view             checkpointDir,
+                                           std::string_view             tokenizerGguf,
+                                           core::ipc::WeightArenaHandle handle) {
+#ifndef MIMIRMIND_HAVE_CUDA
+    (void)checkpointDir;
+    (void)tokenizerGguf;
+    if (handle.fd >= 0) ::close(handle.fd);
+    throw std::runtime_error("InferenceEngine::loadModelSharedArena: needs the CUDA "
+                             "backend (built without MIMIRMIND_ENABLE_CUDA)");
+#else
+    // Own the fd from here on, whatever happens.
+    auto arena = core::ipc::SharedWeightArena::attach(handle.fd, handle.manifest.mapBytes,
+                                                      /*readOnly=*/true);
+    if (!arena) {
+        throw std::runtime_error("InferenceEngine::loadModelSharedArena: " + arena.error());
+    }
+    if (_modelLoaded) {
+        throw std::runtime_error("InferenceEngine: model already loaded");
+    }
+    requirePageableMemoryAccess("shared-weight attach");
+    const auto& m = handle.manifest;
+    if (m.baseModified) {
+        throw std::runtime_error(
+            "InferenceEngine::loadModelSharedArena: the owner applied rune(s) that "
+            "rewrote base bytes; attach needs a pristine base");
+    }
+    const std::string localFp = core::safetensors::checkpointFingerprint(checkpointDir);
+    if (localFp != m.fingerprint) {
+        throw std::runtime_error(
+            "InferenceEngine::loadModelSharedArena: checkpoint fingerprint mismatch — "
+            "owner '" + m.fingerprint + "' vs local '" + localFp + "' for '" +
+            std::string{checkpointDir} + "'");
+    }
+    _weightArena     = std::move(*arena);
+    _weightsReadOnly = true;
+    if (!_runePaths.empty()) {
+        _runeBaseFingerprint = localFp;
+    }
+    if (_modelIdHint.empty()) {
+        _modelIdHint = m.modelId;   // same per-model profile overlay as the owner
+    }
+    applyEarlyLoaderProfileFlags();
+    engine::Nvfp4Loader::loadHeaderOnly(*this, checkpointDir, tokenizerGguf);
+    if (_config.architecture != m.architecture) {
+        throw std::runtime_error("InferenceEngine::loadModelSharedArena: owner arch '" +
+                                 m.architecture + "' vs local '" + _config.architecture +
+                                 "'");
+    }
+    _materializedBf16 = runtime::nvfp4::SharedArenaWeights::bind(m, _weightArena->base());
+    _weights.emplace(runtime::nvfp4::buildBf16WeightsMap(_materializedBf16));
+    MM_LOG_INFO("arena",
+                "attached '{}' read-only: {} tensors, {} MiB mapped (owner model '{}')",
+                std::string{checkpointDir}, _materializedBf16.size(), m.mapBytes >> 20,
+                m.modelId);
+    _pleCheckpointDir = std::string{checkpointDir};
+    finalizeLoad();
+#endif
+}
+
+void InferenceEngine::requirePageableMemoryAccess(const char* what) const {
+#ifdef MIMIRMIND_HAVE_CUDA
+    if (_computeCtx && _computeCtx->kind() == core::backend::BackendKind::Cuda) {
+        const auto& info = static_cast<const core::cuda::CudaComputeContext&>(*_computeCtx)
+                               .cudaContext()
+                               .cudaDeviceInfo();
+        if (info.pageableMemoryAccess) {
+            return;
+        }
+    }
+#endif
+    throw std::runtime_error(std::string{what} +
+                             ": needs a CUDA device with pageableMemoryAccess "
+                             "(kernels read the memfd arena's host pointer directly)");
+}
+
+void InferenceEngine::beginWeightArena() {
+    requirePageableMemoryAccess("sharedWeights");
+#ifdef MIMIRMIND_HAVE_CUDA
+    const auto& info = static_cast<const core::cuda::CudaComputeContext&>(*_computeCtx)
+                           .cudaContext()
+                           .cudaDeviceInfo();
+    // Sparse reserve: the memfd only consumes the pages that are touched.
+    const std::uint64_t reserve = info.totalVram;
+    auto arena = core::ipc::SharedWeightArena::create(
+        "mimirmind-weights-" + (_modelIdHint.empty() ? std::string{"model"} : _modelIdHint),
+        reserve);
+    if (!arena) {
+        throw std::runtime_error("sharedWeights: " + arena.error());
+    }
+    _weightArena = std::move(*arena);
+    MM_LOG_INFO("arena", "model '{}': weights load into a shared memfd arena "
+                "(reserve {} GiB, sparse)", _modelIdHint, reserve >> 30);
+#endif
+}
+
+void InferenceEngine::sealWeightArena() {
+#ifdef MIMIRMIND_HAVE_CUDA
+    auto& alloc =
+        static_cast<core::cuda::CudaComputeContext&>(*_computeCtx).allocator();
+    const std::size_t moved = runtime::nvfp4::SharedArenaWeights::migrateInto(
+        _materializedBf16, *_weightArena,
+        [&alloc](void* dst, const void* src, std::size_t n) { alloc.copyD2D(dst, src, n); });
+    // The weight map holds raw pointers; rebuild it if anything moved.
+    if (moved > 0) {
+        _weights.reset();
+        _weights.emplace(runtime::nvfp4::buildBf16WeightsMap(_materializedBf16));
+    }
+    MM_LOG_INFO("arena",
+                "model '{}': arena sealed — {} live allocations, {} MiB live, {} MiB peak, "
+                "{} buffer(s) moved in after load",
+                _modelIdHint, _weightArena->liveAllocations(),
+                _weightArena->liveBytes() >> 20, _weightArena->peakBytes() >> 20, moved);
+    if (_sharedExport && _sharedExport->hostRegister) {
+        const std::uint64_t extent = _weightArena->highWaterBytes();
+        void* base = _weightArena->base();
+        const cudaError_t rc = cudaHostRegister(base, extent, cudaHostRegisterDefault);
+        if (rc != cudaSuccess) {
+            throw std::runtime_error(std::string{"sharedWeights.hostRegister: "
+                                                 "cudaHostRegister failed: "} +
+                                     cudaGetErrorString(rc));
+        }
+        _arenaHostReg = std::unique_ptr<void, void (*)(void*)>(
+            base, [](void* p) { (void)cudaHostUnregister(p); });
+        MM_LOG_INFO("arena", "model '{}': arena extent {} MiB host-registered",
+                    _modelIdHint, extent >> 20);
+    }
+#endif
+}
+
+void InferenceEngine::publishWeightArena(std::string_view                checkpointDir,
+                                         const std::vector<std::string>& runes) {
+#ifdef MIMIRMIND_HAVE_CUDA
+    core::ipc::WeightArenaManifest m =
+        runtime::nvfp4::SharedArenaWeights::describe(_materializedBf16, *_weightArena);
+    m.modelId       = _modelIdHint;
+    m.architecture  = _config.architecture;
+    m.checkpointDir = std::string{checkpointDir};
+    m.fingerprint   = core::safetensors::checkpointFingerprint(checkpointDir);
+    m.runes         = runes;
+    m.baseModified  = _runesTouchedBase;
+    const std::size_t nTensors = m.tensors.size();
+    const std::uint64_t mapBytes = m.mapBytes;
+    auto exp = std::make_unique<core::ipc::WeightArenaExporter>();
+    auto ok  = exp->start(_sharedExport->socketPath, _weightArena->fd(), std::move(m));
+    if (!ok) {
+        throw std::runtime_error("sharedWeights: " + ok.error());
+    }
+    _arenaExporter = std::move(exp);
+    MM_LOG_INFO("arena", "model '{}': {} tensors / {} MiB published read-only on '{}'",
+                _modelIdHint, nTensors, mapBytes >> 20, _sharedExport->socketPath);
+#else
+    (void)checkpointDir;
+    (void)runes;
+#endif
 }
 
 void InferenceEngine::loadModelAttached(
@@ -947,6 +1123,13 @@ void InferenceEngine::applyRunes() {
         _ops->readbackToHost(dst, src, n);
     };
     io.upload = [this](void* dst, const void* src, std::size_t n) {
+        if (_weightsReadOnly) {
+            // 7.2.3: the weights are another process's read-only arena.
+            throw std::runtime_error(
+                "rune rewrites base tensor bytes, but this engine runs on a "
+                "read-only shared weight arena — only overlay runes (lowrank, "
+                "steer, expert mask) apply on attached weights");
+        }
         _ops->uploadHostBytes(dst, src, n);
     };
     core::rune::Futhark futhark{std::move(io)};
@@ -1000,6 +1183,7 @@ void InferenceEngine::applyRunes() {
             MM_LOG_INFO("futhark", "  {}: {} -> {}", t.name, t.hashBefore, t.hashAfter);
         }
     }
+    _runesTouchedBase = _runesTouchedBase || res->tensorsUploaded > 0;
     MM_LOG_INFO("futhark", "model '{}': {} rune(s) over base '{}', uploaded {} tensor(s) "
                 "/ {} bytes", _modelIdHint, res->reports.size(), base,
                 res->tensorsUploaded, res->bytesUploaded);

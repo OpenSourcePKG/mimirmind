@@ -5,6 +5,7 @@
 #include "hugin/ForwardSupport.hpp"
 
 #include "core/config/Config.hpp"
+#include "core/ipc/WeightArenaExporter.hpp"
 #include "hugin/LogitMath.hpp"
 #include "runtime/InferenceEngine.hpp"
 #include "runtime/nvfp4/ModelFormatResolver.hpp"
@@ -25,6 +26,20 @@ namespace {
 using nlohmann::json;
 using Engine = runtime::InferenceEngine;
 using namespace forward_support;
+
+/// MemAvailable from /proc/meminfo in GiB (0 if unreadable).
+double memAvailableGiB() {
+    std::ifstream f("/proc/meminfo");
+    std::string key;
+    std::uint64_t kib = 0;
+    std::string unit;
+    while (f >> key >> kib >> unit) {
+        if (key == "MemAvailable:") {
+            return static_cast<double>(kib) / (1024.0 * 1024.0);
+        }
+    }
+    return 0.0;
+}
 
 } // namespace
 
@@ -49,7 +64,24 @@ ForwardTools::load(const Target& t, const std::vector<std::string>& runes) const
     std::cerr << "hugin: loading engine for '" << t.path << "'"
               << (runes.empty() ? std::string{} : " with " + std::to_string(runes.size()) + " rune(s)")
               << "\n";
-    if (runtime::nvfp4::resolveModelFormat(core::config::ModelFormat::Auto, t.path) ==
+    if (!_attachSocket.empty()) {
+        // 7.2.3: the live engine's weights, read-only, no second copy.
+        const double availGiB = memAvailableGiB();
+        if (availGiB < _attachMinFreeGiB) {
+            throw std::runtime_error(
+                "refusing to attach: " + std::to_string(availGiB) + " GiB available < " +
+                std::to_string(_attachMinFreeGiB) + " GiB required beside the serving engine");
+        }
+        auto h = core::ipc::fetchWeightArena(_attachSocket, "hugin");
+        if (!h) {
+            throw std::runtime_error(h.error());
+        }
+        std::cerr << "hugin: attaching to '" << h->manifest.modelId << "' via '" << _attachSocket
+                  << "' (" << h->manifest.tensors.size() << " tensors, "
+                  << (h->manifest.mapBytes >> 20) << " MiB, " << availGiB
+                  << " GiB available)\n";
+        l->engine->loadModelSharedArena(t.path, t.tokenizerGguf, std::move(*h));
+    } else if (runtime::nvfp4::resolveModelFormat(core::config::ModelFormat::Auto, t.path) ==
         core::config::ModelFormat::Nvfp4) {
         l->engine->loadModelNvfp4(t.path, t.tokenizerGguf);
     } else {

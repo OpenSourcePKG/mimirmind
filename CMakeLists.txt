@@ -372,8 +372,11 @@ add_library(mimirmind_core_common STATIC
     src/core/ipc/MuninClient.cpp
     src/core/ipc/ShmIpcExporter.cpp
     src/core/ipc/ShmIpcImporter.cpp
+    src/core/ipc/SharedWeightArena.cpp
     src/core/ipc/TensorManifest.cpp
     src/core/ipc/UnixSocketFrame.cpp
+    src/core/ipc/WeightArenaExporter.cpp
+    src/core/ipc/WeightArenaManifest.cpp
     src/core/ipc/WireOps.cpp
     src/munin/ShmAttachSession.cpp
     src/munin/ShmChunkAllocator.cpp
@@ -420,6 +423,7 @@ add_library(mimirmind_core_common STATIC
     src/runtime/nvfp4/NvFp4Model.cpp
     src/runtime/nvfp4/NvFp4Materializer.cpp
     src/runtime/nvfp4/NvFp4WeightsMap.cpp
+    src/runtime/nvfp4/SharedArenaWeights.cpp
     src/runtime/nvfp4/PleNgramTable.cpp
     src/runtime/nvfp4/Qwen3_5MoeConfig.cpp
     src/runtime/nvfp4/Gemma4Config.cpp

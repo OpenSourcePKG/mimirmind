@@ -9,7 +9,9 @@
 #include "core/backend/ComputeContext.hpp"
 #include "core/gguf/GgufReader.hpp"
 #include "core/gguf/WeightsMap.hpp"
+#include "core/ipc/SharedWeightArena.hpp"
 #include "core/ipc/TensorManifest.hpp"
+#include "core/ipc/WeightArenaExporter.hpp"
 #include "core/rune/RuneApplier.hpp"
 #include "model/FusedQkvWeights.hpp"
 #include "core/config/Config.hpp"
@@ -286,6 +288,41 @@ public:
                                 std::string_view                    tokenizerGguf,
                                 const core::ipc::TensorManifest&    manifest,
                                 std::span<void* const>              chunkBases);
+
+    /// 7.2.3: publish this engine's materialized weights to attachers (Hugin).
+    /// Set BEFORE loadModelNvfp4 (config `models[].sharedWeights`). The NVFP4
+    /// loader then allocates its weights from a memfd arena instead of
+    /// cudaMallocManaged, and after load the arena is served read-only on
+    /// `socketPath`. `hostRegister` additionally cudaHostRegister()s the used
+    /// extent (an A/B variant: 7.0 measured 130 vs 99 GB/s under contention).
+    /// Requires a pageableMemoryAccess device (GB10); throws otherwise.
+    struct SharedWeightsExport {
+        std::string socketPath;
+        bool        hostRegister{false};
+    };
+    void setSharedWeightsExport(std::optional<SharedWeightsExport> s) {
+        _sharedExport = std::move(s);
+    }
+
+    /**
+     * 7.2.3 attacher load: build this engine on ANOTHER engine's materialized
+     * weights, received via `core::ipc::fetchWeightArena`. Reads only the
+     * checkpoint header (config + tokenizer) from `checkpointDir`, refuses on a
+     * checkpoint fingerprint mismatch or a rune-modified base, maps the arena
+     * READ-ONLY and binds the weight map to it (no copy). Runes set via
+     * setRunes may only add overlays (lowrank / steer / masks); a rune that
+     * rewrites base bytes fails the load. Takes ownership of `handle.fd`.
+     */
+    void loadModelSharedArena(std::string_view          checkpointDir,
+                              std::string_view          tokenizerGguf,
+                              core::ipc::WeightArenaHandle handle);
+
+    /// True when the weights are another process's read-only arena.
+    [[nodiscard]] bool weightsAttachedReadOnly() const noexcept { return _weightsReadOnly; }
+    /// The owner-side arena exporter, or nullptr (no sharedWeights configured).
+    [[nodiscard]] const core::ipc::WeightArenaExporter* weightArenaExporter() const noexcept {
+        return _arenaExporter.get();
+    }
 
     [[nodiscard]] bool modelLoaded() const noexcept { return _modelLoaded; }
 
@@ -1163,6 +1200,15 @@ private:
     void installConditionalSteers(const std::vector<core::rune::RuneCondSteer>& extra);
     /// Throws when runes are configured for a Munin-attached (shared) load.
     void refuseRunesOnSharedWeights() const;
+    /// 7.2.3 shared weight arena (owner side): create before the load, move
+    /// stragglers in + optional host registration after it, start the
+    /// exporter after finalizeLoad. requirePageableMemoryAccess throws unless
+    /// the CUDA device lets kernels read pageable host memory.
+    void requirePageableMemoryAccess(const char* what) const;
+    void beginWeightArena();
+    void sealWeightArena();
+    void publishWeightArena(std::string_view                checkpointDir,
+                            const std::vector<std::string>& runes);
     /// FusedQkvWeights + GPU-op self-test + matmul autotune (L0-only paths).
     void prepareL0ComputePath();
 #ifdef MIMIRMIND_HAVE_L0
@@ -1266,6 +1312,15 @@ private:
     /// Munin-attached loads, whose weights are shared and never patched.
     std::string                        _runeBaseFingerprint;
     model::Tokenizer                   _tokenizer;
+    // 7.2.3 shared weight arena. Declared BEFORE `_materializedBf16` /
+    // `_weights` so it is destroyed AFTER every buffer that lives in it; the
+    // host registration and the exporter are destroyed before the arena.
+    std::optional<SharedWeightsExport>              _sharedExport;
+    std::unique_ptr<core::ipc::SharedWeightArena>   _weightArena;
+    std::unique_ptr<void, void (*)(void*)>          _arenaHostReg{nullptr, nullptr};
+    std::unique_ptr<core::ipc::WeightArenaExporter> _arenaExporter;
+    bool                                            _weightsReadOnly{false};
+    bool                                            _runesTouchedBase{false};
 #ifdef MIMIRMIND_HAVE_CUDA
     // NVFP4 load path (loadModelNvfp4). `_materializedBf16` owns the BF16
     // device buffers that `_weights` points into, so it is declared BEFORE

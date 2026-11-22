@@ -871,6 +871,11 @@ void ServerBootstrap::loadModels(LoadedModels&                 out,
         } else {
             e->setModelIdHint(m.id);   // for the per-model profile overlay
             e->setRunes(m.runes);      // 7.1 Futhark
+            if (m.sharedWeights) {     // 7.2.3 weight arena for Hugin
+                e->setSharedWeightsExport(
+                    ::mimirmind::runtime::InferenceEngine::SharedWeightsExport{
+                        m.sharedWeights->socket, m.sharedWeights->hostRegister});
+            }
             if (runtime::nvfp4::resolveModelFormat(m.format, m.path)
                 == core::config::ModelFormat::Nvfp4) {
                 MM_LOG_INFO("main", "serve: loading NVFP4 model '{}' (id='{}')",

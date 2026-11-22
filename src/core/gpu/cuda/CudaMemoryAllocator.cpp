@@ -3,6 +3,7 @@
 
 #include "core/gpu/cuda/CudaMemoryAllocator.hpp"
 
+#include "core/ipc/SharedWeightArena.hpp"
 #include "core/log/Log.hpp"
 
 #include <cuda_runtime.h>
@@ -45,6 +46,12 @@ constexpr std::size_t kKvManagedMinBytes      = std::size_t{8} * 1024 * 1024 * 1
 constexpr std::size_t kKvManagedFreeHeadroom  = std::size_t{2} * 1024 * 1024 * 1024;   // 2 GiB
 
 } // namespace
+
+// 7.2.3: arena weights are plain (pageable) host memory; let UVA classify the
+// pointers whenever an arena exists, and keep the explicit kind otherwise.
+static cudaMemcpyKind arenaAwareKind(cudaMemcpyKind k) noexcept {
+    return ipc::SharedWeightArena::anyLive() ? cudaMemcpyDefault : k;
+}
 
 // ---------- CudaMemoryAllocator --------------------------------------------
 
@@ -127,6 +134,25 @@ void CudaMemoryAllocator::unchargeCategory(void* ptr, std::size_t bytes) noexcep
 void* CudaMemoryAllocator::allocate(std::size_t bytes, CudaAllocKind kind) {
     if (bytes == 0) return nullptr;
 
+    // 7.2.3: weight loads under a ScopedWeightArena are served from the
+    // shareable memfd arena instead of cudaMalloc*. The engine only opens the
+    // scope on a pageableMemoryAccess device (GB10), where kernels read the
+    // arena's host pointer directly.
+    if (kind != CudaAllocKind::HostPinned) {
+        if (ipc::SharedWeightArena* arena = ipc::ScopedWeightArena::current()) {
+            void* p = arena->allocate(bytes);
+            if (p == nullptr) {
+                _stats.failedAllocs += 1;
+                throw CudaError("shared weight arena exhausted (" +
+                                    std::to_string(bytes >> 20) + " MiB request)",
+                                cudaErrorMemoryAllocation);
+            }
+            recordAlloc(bytes);
+            chargeCategory(p, bytes);
+            return p;
+        }
+    }
+
     void*       ptr = nullptr;
     cudaError_t rc  = cudaSuccess;
 
@@ -158,6 +184,13 @@ void CudaMemoryAllocator::deallocate(void*         ptr,
                                      CudaAllocKind kind) noexcept {
     if (ptr == nullptr) return;
 
+    if (ipc::SharedWeightArena* arena = ipc::SharedWeightArena::owning(ptr)) {
+        arena->deallocate(ptr);
+        unchargeCategory(ptr, bytes);
+        recordFree(bytes);
+        return;
+    }
+
     cudaError_t rc = cudaSuccess;
     switch (kind) {
         case CudaAllocKind::Device:
@@ -179,21 +212,21 @@ void CudaMemoryAllocator::deallocate(void*         ptr,
 void CudaMemoryAllocator::copyH2D(void* dst, const void* src, std::size_t bytes) {
     if (bytes == 0) return;
     cudaCheck("cudaMemcpyHostToDevice",
-              cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice));
+              cudaMemcpy(dst, src, bytes, arenaAwareKind(cudaMemcpyHostToDevice)));
     _stats.bytesCopiedH2D += bytes;
 }
 
 void CudaMemoryAllocator::copyD2H(void* dst, const void* src, std::size_t bytes) {
     if (bytes == 0) return;
     cudaCheck("cudaMemcpyDeviceToHost",
-              cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost));
+              cudaMemcpy(dst, src, bytes, arenaAwareKind(cudaMemcpyDeviceToHost)));
     _stats.bytesCopiedD2H += bytes;
 }
 
 void CudaMemoryAllocator::copyD2D(void* dst, const void* src, std::size_t bytes) {
     if (bytes == 0) return;
     cudaCheck("cudaMemcpyDeviceToDevice",
-              cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToDevice));
+              cudaMemcpy(dst, src, bytes, arenaAwareKind(cudaMemcpyDeviceToDevice)));
     _stats.bytesCopiedD2D += bytes;
 }
 
@@ -242,6 +275,9 @@ void CudaMemoryAllocator::adviseReadMostly(void* ptr, std::size_t bytes) noexcep
         // Discrete cards don't benefit from these hints meaningfully;
         // save the driver call.
         return;
+    }
+    if (ipc::SharedWeightArena::owning(ptr) != nullptr) {
+        return;   // 7.2.3: arena memory is not managed; the advice does not apply
     }
 
     const int dev = _ctx.cudaDeviceIndex();

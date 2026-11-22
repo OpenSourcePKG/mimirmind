@@ -56,7 +56,20 @@ public:
                      std::string_view                     tokenizerGguf,
                      core::safetensors::SafetensorsModel* attachedSm = nullptr);
 
+    /// 7.2.3 shared-weight attach: read only the checkpoint header (config +
+    /// tokenizer) into `engine`, no weights. The weight map comes from the
+    /// owner's arena manifest. Kolibri-1 only for now; throws otherwise.
+    static void loadHeaderOnly(InferenceEngine& engine,
+                               std::string_view checkpointDir,
+                               std::string_view tokenizerGguf);
+
 private:
+    /// Kolibri-1 config.json + generation defaults + tokenizer.
+    static void loadKolibri1Header(InferenceEngine&   e,
+                                   const std::string& dir,
+                                   const std::string& configText,
+                                   std::string_view   tokenizerGguf);
+
     // Post-plan stages of load(), extracted verbatim so the pipeline reads as
     // a sequence of named passes. All are friends of InferenceEngine (as the
     // enclosing class is) and are compiled only under MIMIRMIND_HAVE_CUDA;

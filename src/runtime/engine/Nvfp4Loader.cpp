@@ -10,6 +10,7 @@
 #include "compute/cuda/CudaMaterializerOps.hpp"
 #include "core/gpu/cuda/CudaComputeContext.hpp"
 #include "core/gpu/cuda/CudaMemoryAllocator.hpp"
+#include "core/ipc/SharedWeightArena.hpp"
 #include "core/log/Log.hpp"
 #include "core/modelopt/BlockScaleSwizzle.hpp"
 #include "core/modelopt/CompressedTensorsConfig.hpp"
@@ -53,6 +54,11 @@ void Nvfp4Loader::load(InferenceEngine&, std::string_view, std::string_view,
                              "backend (built without MIMIRMIND_ENABLE_CUDA)");
 }
 
+void Nvfp4Loader::loadHeaderOnly(InferenceEngine&, std::string_view, std::string_view) {
+    throw std::runtime_error("Nvfp4Loader::loadHeaderOnly: NVFP4 requires the CUDA "
+                             "backend (built without MIMIRMIND_ENABLE_CUDA)");
+}
+
 #else
 
 namespace {
@@ -86,6 +92,20 @@ compute::ComputeBuffer bigBlockAlloc(core::cuda::CudaComputeContext& ctx,
         throw std::runtime_error(
             "bigBlockAlloc: request " + std::to_string(bytes)
             + " exceeds the 512 MiB block quantum");
+    }
+    // 7.2.3: under a shared weight arena, bypass the process-lifetime pool —
+    // the arena itself recycles a freed slab's range for the next bank and
+    // punches the pages back to the OS, and pool blocks must never outlive
+    // the engine that owns the arena.
+    if (core::ipc::ScopedWeightArena::current() != nullptr) {
+        void* raw = ctx.allocator().allocate(bytes, core::cuda::CudaAllocKind::Managed);
+        return compute::ComputeBuffer{
+            raw, bytes,
+            [](void* p, std::size_t b, void* c) noexcept {
+                static_cast<core::cuda::CudaMemoryAllocator*>(c)
+                    ->deallocate(p, b, core::cuda::CudaAllocKind::Managed);
+            },
+            &ctx.allocator()};
     }
     auto& pool = bigBlockPool();
     void* ptr = nullptr;
@@ -424,15 +444,10 @@ void Nvfp4Loader::loadGemma4(InferenceEngine&                     e,
                     e._materializedBf16.size());
 }
 
-void Nvfp4Loader::loadKolibri1(InferenceEngine&                     e,
-                               const std::string&                   dir,
-                               const std::string&                   configText,
-                               std::string_view                     checkpointDir,
-                               std::string_view                     tokenizerGguf,
-                               core::safetensors::SafetensorsModel* attachedSm) {
-    MM_LOG_INFO("engine",
-                "loadModelNvfp4: '{}' — Kolibri-1 (pure-attention MoE, FP8 "
-                "128x128-block)", checkpointDir);
+void Nvfp4Loader::loadKolibri1Header(InferenceEngine&   e,
+                                     const std::string& dir,
+                                     const std::string& configText,
+                                     std::string_view   tokenizerGguf) {
     // 1. Arch params from config.json.
     e._config = runtime::nvfp4::parseKolibri1SafetensorsConfig(configText);
     applyGenerationConfigDefaults(e._config, dir);
@@ -446,6 +461,42 @@ void Nvfp4Loader::loadKolibri1(InferenceEngine&                     e,
         e._reader.open(tokenizerGguf);
         e._tokenizer.loadFromGguf(e._reader);
     }
+}
+
+void Nvfp4Loader::loadHeaderOnly(InferenceEngine& e,
+                                 std::string_view checkpointDir,
+                                 std::string_view tokenizerGguf) {
+    const std::string dir{checkpointDir};
+    std::ifstream f(std::filesystem::path{dir} / "config.json");
+    if (!f) {
+        throw std::runtime_error("Nvfp4Loader::loadHeaderOnly: cannot read " + dir +
+                                 "/config.json");
+    }
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const std::string configText = ss.str();
+    // 7.2.3: shared-weight attach rebuilds the weight map from the owner's
+    // manifest, so only the header (config + tokenizer) is read here. Kolibri-1
+    // is the first architecture wired; the others keep their config parse
+    // interleaved with the upload and refuse until they are split the same way.
+    if (!runtime::nvfp4::isKolibri1Config(configText)) {
+        throw std::runtime_error("Nvfp4Loader::loadHeaderOnly: shared-weight attach "
+                                 "supports kolibri1 checkpoints only (got '" + dir + "')");
+    }
+    loadKolibri1Header(e, dir, configText, tokenizerGguf);
+}
+
+void Nvfp4Loader::loadKolibri1(InferenceEngine&                     e,
+                               const std::string&                   dir,
+                               const std::string&                   configText,
+                               std::string_view                     checkpointDir,
+                               std::string_view                     tokenizerGguf,
+                               core::safetensors::SafetensorsModel* attachedSm) {
+    MM_LOG_INFO("engine",
+                "loadModelNvfp4: '{}' — Kolibri-1 (pure-attention MoE, FP8 "
+                "128x128-block)", checkpointDir);
+    // 1.+2. Arch params from config.json, tokenizer.
+    loadKolibri1Header(e, dir, configText, tokenizerGguf);
 
     // 3. Upload the FP8 weights (+ F32 block-scale grids + BF16 passthroughs)
     //    to the device. The routed-expert sources go through the big-block pool

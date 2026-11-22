@@ -388,7 +388,7 @@ void CudaMaterializerOps::permuteColsAsync(void* dst, const void* src,
 
 float CudaMaterializerOps::readF32(const void* devPtr) {
     float host = 0.0F;
-    const cudaError_t rc = cudaMemcpy(&host, devPtr, sizeof(float), cudaMemcpyDeviceToHost);
+    const cudaError_t rc = cudaMemcpy(&host, devPtr, sizeof(float), cudaMemcpyDefault);
     if (rc != cudaSuccess) {
         throw std::runtime_error(std::string("CudaMaterializerOps::readF32: cudaMemcpy failed: ")
                                  + cudaGetErrorString(rc));

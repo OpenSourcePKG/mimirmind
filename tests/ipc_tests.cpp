@@ -11,13 +11,18 @@
 #include "core/ipc/MuninClient.hpp"
 #include "core/ipc/TensorManifest.hpp"
 #include "core/ipc/UnixSocketFrame.hpp"
+#include "core/ipc/SharedWeightArena.hpp"
+#include "core/ipc/WeightArenaExporter.hpp"
+#include "core/ipc/WeightArenaManifest.hpp"
 #include "munin/ShmAttachSession.hpp"
 #include "munin/ShmChunkAllocator.hpp"
 #include "munin/ShmLoadedModel.hpp"
 #include "munin/ShmModelStore.hpp"
 #include "munin/ShmSocketServer.hpp"
 
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -1178,6 +1183,184 @@ TEST(shmNvfp4_endToEnd_attachReconstructsShards) {
     server.join();
     sp.a = -1;
     std::filesystem::remove_all(ckpt);
+}
+
+// ---- 7.2.3 SharedWeightArena / WeightArenaManifest / WeightArenaExporter ----
+
+namespace {
+
+using ::mimirmind::core::ipc::ScopedWeightArena;
+using ::mimirmind::core::ipc::SharedWeightArena;
+using ::mimirmind::core::ipc::WeightArenaManifest;
+
+std::uint64_t residentKiB(int fd) {
+    // st_blocks of a memfd = pages actually backing it (512-byte units).
+    struct stat st {};
+    ::fstat(fd, &st);
+    return static_cast<std::uint64_t>(st.st_blocks) / 2;
+}
+
+WeightArenaManifest sampleManifest() {
+    WeightArenaManifest m;
+    m.modelId       = "kolibri1";
+    m.architecture  = "kolibri1";
+    m.checkpointDir = "/models/k";
+    m.fingerprint   = "fp:abc";
+    m.mapBytes      = 1 << 20;
+    m.runes         = {"a.rune"};
+    m.baseModified  = false;
+    m.tensors.push_back({"blk.0.attn_q.weight", {64, 32}, 2048, {"fp8"},
+                         {{"data", 4096, 2176}}});
+    m.tensors.push_back({"blk.0.ffn_gate_exps.weight", {64, 32, 8}, 16384,
+                         {"nvfp4blk", "nvfp4tc"},
+                         {{"data", 8192, 9216}, {"tcNibble", 20480, 8192}}});
+    return m;
+}
+
+} // namespace
+
+TEST(sharedWeightArena_allocFreeCoalesceAndPunch) {
+    auto a = SharedWeightArena::create("test-arena", 64ULL << 20);
+    EXPECT_TRUE(a.has_value());
+    if (!a) return;
+    SharedWeightArena& arena = **a;
+    EXPECT_TRUE(arena.owner());
+    void* p1 = arena.allocate(10);          // rounds to one page
+    void* p2 = arena.allocate(5 << 20);
+    void* p3 = arena.allocate(4096);
+    EXPECT_TRUE(p1 != nullptr && p2 != nullptr && p3 != nullptr);
+    EXPECT_EQ(arena.offsetOf(p1), std::uint64_t{0});
+    EXPECT_EQ(arena.offsetOf(p2), std::uint64_t{4096});
+    EXPECT_EQ(arena.allocationBytes(p2), std::size_t{5} << 20);
+    EXPECT_EQ(arena.liveAllocations(), std::size_t{3});
+    EXPECT_TRUE(SharedWeightArena::owning(p2) == &arena);
+    EXPECT_TRUE(SharedWeightArena::anyLive());
+
+    std::memset(p2, 0x5A, 5 << 20);
+    const std::uint64_t before = residentKiB(arena.fd());
+    EXPECT_TRUE(before >= (5u << 10));
+    arena.deallocate(p2);
+    const std::uint64_t after = residentKiB(arena.fd());
+    EXPECT_TRUE(before - after >= (5u << 10) - 64);   // pages went back to the OS
+    // The freed range reads as zero and is reused first-fit.
+    void* p4 = arena.allocate(1 << 20);
+    EXPECT_EQ(arena.offsetOf(p4), std::uint64_t{4096});
+    EXPECT_EQ(static_cast<unsigned char*>(p4)[100], static_cast<unsigned char>(0));
+    // Free everything: the free list coalesces back to one range, so a
+    // reserve-sized allocation fits again.
+    arena.deallocate(p1);
+    arena.deallocate(p3);
+    arena.deallocate(p4);
+    EXPECT_EQ(arena.liveBytes(), std::uint64_t{0});
+    void* whole = arena.allocate(64ULL << 20);
+    EXPECT_TRUE(whole != nullptr);
+    EXPECT_TRUE(arena.allocate(1) == nullptr);   // exhausted
+    arena.deallocate(whole);
+    EXPECT_EQ(arena.peakBytes(), std::uint64_t{64} << 20);
+}
+
+TEST(sharedWeightArena_scopeRoutesAndNests) {
+    auto a = SharedWeightArena::create("test-scope", 1 << 20);
+    EXPECT_TRUE(a.has_value());
+    if (!a) return;
+    EXPECT_TRUE(ScopedWeightArena::current() == nullptr);
+    {
+        ScopedWeightArena outer{a->get()};
+        EXPECT_TRUE(ScopedWeightArena::current() == a->get());
+        {
+            ScopedWeightArena off{nullptr};
+            EXPECT_TRUE(ScopedWeightArena::current() == nullptr);
+        }
+        EXPECT_TRUE(ScopedWeightArena::current() == a->get());
+    }
+    EXPECT_TRUE(ScopedWeightArena::current() == nullptr);
+}
+
+TEST(sharedWeightArena_attachSeesOwnerBytesReadOnly) {
+    auto a = SharedWeightArena::create("test-attach", 1 << 20);
+    EXPECT_TRUE(a.has_value());
+    if (!a) return;
+    auto* p = static_cast<std::uint32_t*>((*a)->allocate(8192));
+    for (int i = 0; i < 2048; ++i) p[i] = 0xC0DE0000u + static_cast<std::uint32_t>(i);
+    const int dupFd = ::open(("/proc/self/fd/" + std::to_string((*a)->fd())).c_str(),
+                             O_RDONLY | O_CLOEXEC);
+    EXPECT_TRUE(dupFd >= 0);
+    auto att = SharedWeightArena::attach(dupFd, 8192, /*readOnly=*/true);
+    EXPECT_TRUE(att.has_value());
+    if (!att) return;
+    const auto* q = static_cast<const std::uint32_t*>((*att)->base());
+    EXPECT_EQ(q[0], 0xC0DE0000u);
+    EXPECT_EQ(q[2047], 0xC0DE07FFu);
+    p[5] = 42;   // owner writes are visible to the attacher at once
+    EXPECT_EQ(q[5], 42u);
+    EXPECT_TRUE(!(*att)->owner());
+    EXPECT_TRUE((*att)->allocate(16) == nullptr);
+    // A read-only fd cannot be mapped writable.
+    const int ro = ::open(("/proc/self/fd/" + std::to_string((*a)->fd())).c_str(),
+                          O_RDONLY | O_CLOEXEC);
+    void* w = ::mmap(nullptr, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, ro, 0);
+    EXPECT_TRUE(w == MAP_FAILED);
+    ::close(ro);
+}
+
+TEST(weightArenaManifest_roundTrip) {
+    const WeightArenaManifest m = sampleManifest();
+    auto back = WeightArenaManifest::fromJson(m.toJson());
+    EXPECT_TRUE(back.has_value());
+    if (!back) return;
+    EXPECT_EQ(back->modelId, std::string{"kolibri1"});
+    EXPECT_EQ(back->fingerprint, std::string{"fp:abc"});
+    EXPECT_EQ(back->mapBytes, std::uint64_t{1} << 20);
+    EXPECT_EQ(back->runes.size(), std::size_t{1});
+    EXPECT_EQ(back->tensors.size(), std::size_t{2});
+    EXPECT_EQ(back->tensors[1].flags.size(), std::size_t{2});
+    EXPECT_EQ(back->tensors[1].buffers[1].role, std::string{"tcNibble"});
+    EXPECT_EQ(back->tensors[1].buffers[1].offset, std::uint64_t{20480});
+    EXPECT_EQ(back->tensors[0].dims[1], std::uint64_t{32});
+}
+
+TEST(weightArenaManifest_rejectsOutOfExtentAndVersion) {
+    WeightArenaManifest m = sampleManifest();
+    m.tensors[0].buffers[0].offset = m.mapBytes;   // past the end
+    EXPECT_TRUE(!WeightArenaManifest::fromJson(m.toJson()).has_value());
+    WeightArenaManifest v = sampleManifest();
+    v.version = 99;
+    EXPECT_TRUE(!WeightArenaManifest::fromJson(v.toJson()).has_value());
+    EXPECT_TRUE(!WeightArenaManifest::fromJson("not json").has_value());
+}
+
+TEST(weightArenaExporter_servesManifestAndReadOnlyFd) {
+    auto a = SharedWeightArena::create("test-export", 1 << 20);
+    EXPECT_TRUE(a.has_value());
+    if (!a) return;
+    auto* p = static_cast<std::uint8_t*>((*a)->allocate(1 << 20));
+    p[12345] = 0x77;
+    const std::string sock = (std::filesystem::temp_directory_path() /
+                              ("mm-arena-test-" + std::to_string(::getpid()) + ".sock"))
+                                 .string();
+    ::mimirmind::core::ipc::WeightArenaExporter exp;
+    WeightArenaManifest m = sampleManifest();
+    auto ok = exp.start(sock, (*a)->fd(), m);
+    EXPECT_TRUE(ok.has_value());
+    if (!ok) return;
+    for (int round = 0; round < 2; ++round) {
+        auto h = ::mimirmind::core::ipc::fetchWeightArena(sock, "test");
+        EXPECT_TRUE(h.has_value());
+        if (!h) return;
+        EXPECT_EQ(h->manifest.tensors.size(), std::size_t{2});
+        EXPECT_EQ(h->manifest.modelId, std::string{"kolibri1"});
+        void* w = ::mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, h->fd, 0);
+        EXPECT_TRUE(w == MAP_FAILED);   // read-only descriptor
+        auto att = SharedWeightArena::attach(h->fd, h->manifest.mapBytes, true);
+        EXPECT_TRUE(att.has_value());
+        if (!att) return;
+        EXPECT_EQ(static_cast<const std::uint8_t*>((*att)->base())[12345],
+                  static_cast<std::uint8_t>(0x77));
+    }
+    EXPECT_EQ(exp.attachCount(), std::uint64_t{2});
+    exp.stop();
+    EXPECT_TRUE(!std::filesystem::exists(sock));
+    EXPECT_TRUE(!::mimirmind::core::ipc::fetchWeightArena(sock, "test").has_value());
 }
 
 int main() {

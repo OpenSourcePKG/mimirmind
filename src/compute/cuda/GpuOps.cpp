@@ -7,6 +7,7 @@
 
 #include "core/gpu/cuda/CudaComputeContext.hpp"
 #include "core/gpu/cuda/CudaKernel.hpp"
+#include "core/ipc/SharedWeightArena.hpp"
 #if MIMIRMIND_HAVE_CUDNN_SDPA
 #include "compute/cuda/CudnnSdpaPrefill.hpp"
 #endif
@@ -1222,8 +1223,12 @@ void GpuOps::uploadHostBytes(void*       deviceDst,
     // may reuse/mutate the source immediately (the historical host-sync contract
     // is preserved), while the staging -> device DMA is enqueued on the engine
     // stream and thus correctly ordered ahead of every consuming kernel.
+    // 7.2.3: arena weights are pageable host memory — let UVA classify them
+    // while an arena exists; the explicit kind is kept otherwise.
+    const cudaMemcpyKind kind = core::ipc::SharedWeightArena::anyLive()
+                                    ? cudaMemcpyDefault : cudaMemcpyHostToDevice;
     const cudaError_t rc = cudaMemcpyAsync(
-        deviceDst, hostSrc, bytes, cudaMemcpyHostToDevice, _ctx.stream().handle());
+        deviceDst, hostSrc, bytes, kind, _ctx.stream().handle());
     if (rc != cudaSuccess) {
         throw std::runtime_error(
             std::string{"compute::cuda::GpuOps::uploadHostBytes: "
