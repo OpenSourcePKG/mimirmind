@@ -2,6 +2,7 @@
 // Copyright 2026 Stefan Werfling
 
 #include "hugin/ForwardTools.hpp"
+#include "hugin/ForwardReport.hpp"
 #include "hugin/ForwardSupport.hpp"
 
 #include "core/config/Config.hpp"
@@ -12,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -93,6 +95,63 @@ ForwardTools::load(const Target& t, const std::vector<std::string>& runes) const
 namespace {
 bool sameTarget(const ForwardTools::Target& a, const ForwardTools::Target& b) {
     return a.path == b.path && a.tokenizerGguf == b.tokenizerGguf;
+}
+
+/// The model's tokenizer as a ForwardReport::Piece.
+ForwardReport::Piece pieceOf(const Engine& e) {
+    return [&e](std::int32_t id) { return piece(e, id); };
+}
+
+/// The attention stages one forward captured for `block`, or nullopt when the
+/// backend does not expose them.
+std::optional<ForwardReport::AttentionStages>
+attentionStages(const Engine& e, const Engine::ForwardProbe& probe, std::uint32_t block) {
+    const auto find = [&](const char* name) -> const Engine::ForwardProbe::Stage* {
+        const auto it = probe.stageData.find({name, block});
+        return it == probe.stageData.end() ? nullptr : &it->second;
+    };
+    ForwardReport::AttentionStages s;
+    s.q   = find("Qcur");
+    s.k   = find("Kcur");
+    s.v   = find("Vcur");
+    s.ctx = find("attn_ctx");
+    const auto* scale = find("attn_scale");
+    if (s.q == nullptr || s.k == nullptr || s.v == nullptr || s.ctx == nullptr || scale == nullptr ||
+        scale->data.empty()) {
+        return std::nullopt;
+    }
+    s.scale     = scale->data.front();
+    s.headCount = e.config().headCount;
+    if (const auto* w = find("attn_window"); w != nullptr && !w->data.empty()) {
+        s.window = static_cast<std::size_t>(w->data.front());
+    }
+    return s;
+}
+
+/// expert_usage over the routing taps of one forward; null when none was captured.
+json expertUsage(const Engine& e, std::span<const std::int32_t> ids, const Engine::ForwardProbe& probe,
+                 std::optional<std::size_t> pos, std::size_t topN) {
+    const std::size_t nExperts = e.config().expertCount;
+    json blocks = json::array();
+    std::vector<double> totalCount(nExperts, 0.0);
+    for (const auto& [key, st] : probe.stageData) {
+        if (key.first != "moe_topk_idx") {
+            continue;
+        }
+        const auto wIt = probe.stageData.find({"moe_topk_w", key.second});
+        blocks.push_back(ForwardReport::expertBlock(key.second, st,
+                                                    wIt == probe.stageData.end() ? nullptr : &wIt->second,
+                                                    nExperts, topN, pos, totalCount));
+    }
+    if (blocks.empty()) {
+        return nullptr;
+    }
+    json out = ForwardReport::expertSummary(totalCount, topN);
+    out["tokens"]     = ids.size();
+    out["experts"]    = nExperts;
+    out["moe_blocks"] = blocks.size();
+    out["blocks"]     = std::move(blocks);
+    return out;
 }
 } // namespace
 
@@ -267,49 +326,8 @@ void ForwardTools::registerOn(McpServer& server) {
             };
             json blocks = json::array();
             for (const auto b : wanted) {
-                const auto x = row(b);
-                // Statistics over finite values; non-finite ones are counted
-                // (a NaN/Inf residual is itself a finding worth reporting).
-                double sum = 0, sq = 0, amax = 0;
-                std::size_t nonFinite = 0;
-                std::vector<double> mag(d, 0.0);
-                for (std::size_t i = 0; i < d; ++i) {
-                    const double v = x[i];
-                    if (!std::isfinite(v)) {
-                        ++nonFinite;
-                        continue;
-                    }
-                    sum += v;
-                    sq += v * v;
-                    mag[i] = std::fabs(v);
-                    amax   = std::max(amax, mag[i]);
-                }
-                const double finiteN = static_cast<double>(std::max<std::size_t>(1, d - nonFinite));
-                const double mean = sum / finiteN;
-                json dims = json::array();
-                for (const auto i : LogitMath::topK(mag, k)) {
-                    dims.push_back({{"dim", i}, {"value", x[static_cast<std::size_t>(i)]}});
-                }
-                json o{{"block", b}, {"l2", std::sqrt(sq)}, {"mean", mean},
-                       {"std", std::sqrt(std::max(0.0, sq / finiteN - mean * mean))},
-                       {"abs_max", amax}, {"non_finite", nonFinite}, {"top_dims", dims}};
-                if (b > 0) {
-                    const auto p = row(b - 1);
-                    double dsq = 0, dot = 0, psq = 0;
-                    for (std::size_t i = 0; i < d; ++i) {
-                        const double xv = x[i];
-                        const double pv = p[i];
-                        dsq += (xv - pv) * (xv - pv);
-                        dot += xv * pv;
-                        psq += pv * pv;
-                    }
-                    o["update_l2"]      = std::sqrt(dsq);
-                    o["cos_prev_block"] = (sq > 0 && psq > 0) ? dot / std::sqrt(sq * psq) : 0.0;
-                }
-                if (values) {
-                    o["values"] = std::vector<float>(x.begin(), x.end());
-                }
-                blocks.push_back(std::move(o));
+                const auto prev = b > 0 ? std::optional<std::span<const float>>(row(b - 1)) : std::nullopt;
+                blocks.push_back(ForwardReport::residual(b, row(b), prev, k, values));
             }
             return json{{"position", pos}, {"token_at_position", piece(e, ids[pos])},
                         {"d_model", d}, {"blocks", blocks}};
@@ -393,126 +411,30 @@ void ForwardTools::registerOn(McpServer& server) {
             probe.stages      = {"Qcur", "Kcur", "Vcur", "attn_ctx", "attn_scale", "attn_window"};
             probe.stageBlocks = {blk};
             (void)forward(e, ids, &probe);
-            const auto get = [&](const char* name) -> const Engine::ForwardProbe::Stage& {
-                const auto it = probe.stageData.find({name, blk});
-                if (it == probe.stageData.end()) {
-                    throw std::runtime_error("architecture '" + e.config().architecture +
-                                             "' does not expose stage '" + name +
-                                             "' (attention_pattern supports llama/qwen2/kolibri1 today)");
-                }
-                return it->second;
-            };
-            const auto& Q = get("Qcur");
-            const auto& K = get("Kcur");
-            const auto& V = get("Vcur");
-            const auto& C = get("attn_ctx");
-            const double scale = get("attn_scale").data.at(0);
-            // Per-layer geometry from the captured shapes (GQA width and head
-            // dim may differ per layer, e.g. kolibri1 SWA vs full layers).
-            const std::size_t H = e.config().headCount;
-            if (H == 0 || C.cols % H != 0) {
-                throw std::runtime_error("attn_ctx width is not a multiple of the head count");
+            const auto stages = attentionStages(e, probe, blk);
+            if (!stages) {
+                throw std::runtime_error("architecture '" + e.config().architecture +
+                                         "' does not expose the attention stages "
+                                         "(attention_pattern supports llama/qwen2/kolibri1 today)");
             }
-            const std::size_t hd  = C.cols / H;
-            const std::size_t Hkv = hd > 0 ? K.cols / hd : 0;
-            if (Q.cols != H * hd || Hkv == 0 || K.cols != Hkv * hd || V.cols != Hkv * hd ||
-                H % Hkv != 0 || Q.rows != ids.size() || K.rows < ids.size() || V.rows < ids.size()) {
-                throw std::runtime_error("unexpected stage shapes for attention_pattern");
-            }
-            std::size_t window = 0;
-            if (const auto it = probe.stageData.find({"attn_window", blk}); it != probe.stageData.end()) {
-                window = static_cast<std::size_t>(it->second.data.at(0));
-            }
-            std::size_t spanLo = 0, spanHi = 0;
-            const bool hasSpan = a.contains("span");
-            if (hasSpan) {
+            ForwardReport::AttentionOptions o;
+            o.position = pos;
+            o.topK     = a.value("top_k", std::size_t{5});
+            o.full     = a.value("full", false);
+            if (a.contains("span")) {
                 const auto sp = a["span"].get<std::vector<std::int64_t>>();
                 if (sp.size() != 2 || sp[0] < 0 || sp[1] <= sp[0] ||
                     sp[1] > static_cast<std::int64_t>(ids.size())) {
                     throw std::runtime_error("'span' must be [start, end) with 0 <= start < end <= tokens");
                 }
-                spanLo = static_cast<std::size_t>(sp[0]);
-                spanHi = static_cast<std::size_t>(sp[1]);
+                o.span = std::pair{static_cast<std::size_t>(sp[0]), static_cast<std::size_t>(sp[1])};
             }
-            std::vector<std::size_t> heads;
             if (a.contains("heads")) {
                 for (const auto& v : a["heads"]) {
-                    const auto h = v.get<std::size_t>();
-                    if (h >= H) throw std::runtime_error("head " + std::to_string(h) + " out of range");
-                    heads.push_back(h);
+                    o.heads.push_back(v.get<std::size_t>());
                 }
-            } else {
-                for (std::size_t h = 0; h < H; ++h) heads.push_back(h);
             }
-            const std::size_t k = a.value("top_k", std::size_t{5});
-            const bool full     = a.value("full", false);
-            const std::size_t n = pos + 1;   // causal: keys 0..pos
-            // Sliding window as the kernel applies it: keys [n - window, n).
-            const std::size_t kMin = (window > 0 && n > window) ? n - window : 0;
-            double maxErr = 0, maxRef = 0;
-            std::vector<double> avg(n, 0.0);
-            json out = json::array();
-            std::vector<std::pair<double, std::size_t>> bySpan;
-            for (const auto h : heads) {
-                const std::size_t kvh = h / (H / Hkv);
-                const float* q = Q.data.data() + pos * Q.cols + h * hd;
-                std::vector<double> w(n, 0.0);
-                double mx = -1e300;
-                for (std::size_t j = kMin; j < n; ++j) {
-                    const float* kr = K.data.data() + j * K.cols + kvh * hd;
-                    double dot = 0;
-                    for (std::size_t d = 0; d < hd; ++d) dot += static_cast<double>(q[d]) * static_cast<double>(kr[d]);
-                    w[j] = dot * scale;
-                    mx = std::max(mx, w[j]);
-                }
-                double z = 0;
-                for (std::size_t j = kMin; j < n; ++j) { w[j] = std::exp(w[j] - mx); z += w[j]; }
-                double ent = 0, spanW = 0;
-                for (std::size_t j = kMin; j < n; ++j) {
-                    w[j] /= z;
-                    avg[j] += w[j] / static_cast<double>(heads.size());
-                    if (w[j] > 0) ent -= w[j] * std::log(w[j]);
-                    if (hasSpan && j >= spanLo && j < spanHi) spanW += w[j];
-                }
-                for (std::size_t d = 0; d < hd; ++d) {
-                    double ctx = 0;
-                    for (std::size_t j = 0; j < n; ++j) ctx += w[j] * static_cast<double>(V.data[j * V.cols + kvh * hd + d]);
-                    const double ref = C.data[pos * C.cols + h * hd + d];
-                    maxErr = std::max(maxErr, std::fabs(ctx - ref));
-                    maxRef = std::max(maxRef, std::fabs(ref));
-                }
-                json top = json::array();
-                for (const auto j : LogitMath::topK(w, k)) {
-                    top.push_back({{"pos", j}, {"token", piece(e, ids[static_cast<std::size_t>(j)])},
-                                   {"weight", w[static_cast<std::size_t>(j)]}});
-                }
-                json o{{"head", h}, {"kv_head", kvh}, {"entropy", ent}, {"bos_weight", w[0]},
-                       {"self_weight", w[pos]}, {"top", top}};
-                if (hasSpan) {
-                    o["span_weight"] = spanW;
-                    bySpan.emplace_back(spanW, h);
-                }
-                if (full) o["weights"] = w;
-                out.push_back(std::move(o));
-            }
-            json avgTop = json::array();
-            for (const auto j : LogitMath::topK(avg, k)) {
-                avgTop.push_back({{"pos", j}, {"token", piece(e, ids[static_cast<std::size_t>(j)])},
-                                  {"weight", avg[static_cast<std::size_t>(j)]}});
-            }
-            json res{{"block", blk}, {"position", pos}, {"query_token", piece(e, ids[pos])},
-                     {"heads", H}, {"kv_heads", Hkv}, {"head_dim", hd}, {"scale", scale},
-                     {"window", window},
-                     {"consistency", {{"max_abs_err", maxErr}, {"max_abs_ref", maxRef}}},
-                     {"head_average_top", avgTop}, {"per_head", out}};
-            if (hasSpan) {
-                std::sort(bySpan.begin(), bySpan.end(), std::greater<>{});
-                json ranked = json::array();
-                for (const auto& [wgt, h] : bySpan) ranked.push_back({{"head", h}, {"span_weight", wgt}});
-                res["span"] = {spanLo, spanHi};
-                res["heads_by_span_weight"] = ranked;
-            }
-            return res;
+            return ForwardReport::attention(*stages, ids, pieceOf(e), blk, o);
         });
 
     server.addTool(
@@ -589,86 +511,160 @@ void ForwardTools::registerOn(McpServer& server) {
             }
             (void)forward(e, ids, &probe);
             const std::size_t topN = a.value("top_k", std::size_t{8});
-            const std::size_t nExperts = e.config().expertCount;
             std::optional<std::size_t> pos;
             if (a.contains("position")) {
                 pos = positionArg(a, ids.size());
             }
-            json blocks = json::array();
-            std::vector<double> totalCount(nExperts, 0.0);
-            for (const auto& [key, st] : probe.stageData) {
-                if (key.first != "moe_topk_idx") {
-                    continue;
-                }
-                const auto wIt = probe.stageData.find({"moe_topk_w", key.second});
-                const std::size_t T = st.rows, K = st.cols;
-                std::vector<double> count(nExperts, 0.0), weight(nExperts, 0.0);
-                for (std::size_t t = 0; t < T; ++t) {
-                    for (std::size_t k = 0; k < K; ++k) {
-                        const auto ex = static_cast<std::size_t>(st.data[t * K + k]);
-                        if (ex >= nExperts) {
-                            throw std::runtime_error("expert id out of range in block " +
-                                                     std::to_string(key.second));
-                        }
-                        count[ex] += 1.0;
-                        totalCount[ex] += 1.0;
-                        if (wIt != probe.stageData.end()) {
-                            weight[ex] += static_cast<double>(wIt->second.data[t * K + k]);
-                        }
-                    }
-                }
-                std::size_t distinct = 0;
-                double ent = 0;
-                const double picks = static_cast<double>(T * K);
-                for (const double c : count) {
-                    if (c > 0) {
-                        ++distinct;
-                        ent -= (c / picks) * std::log(c / picks);
-                    }
-                }
-                json byCount = json::array(), byWeight = json::array();
-                for (const auto ex : LogitMath::topK(count, topN)) {
-                    if (count[static_cast<std::size_t>(ex)] > 0)
-                        byCount.push_back({{"expert", ex}, {"tokens", count[static_cast<std::size_t>(ex)]}});
-                }
-                for (const auto ex : LogitMath::topK(weight, topN)) {
-                    if (weight[static_cast<std::size_t>(ex)] > 0)
-                        byWeight.push_back({{"expert", ex}, {"weight", weight[static_cast<std::size_t>(ex)]}});
-                }
-                json b{{"block", key.second}, {"tokens", T}, {"k", K}, {"distinct_experts", distinct},
-                       {"load_entropy", ent},
-                       {"max_entropy", std::log(static_cast<double>(std::min<std::size_t>(nExperts, T * K)))},
-                       {"top_by_count", byCount}, {"top_by_weight", byWeight}};
-                if (pos) {
-                    json picksAt = json::array();
-                    for (std::size_t k = 0; k < K; ++k) {
-                        json p{{"expert", static_cast<std::int64_t>(st.data[*pos * K + k])}};
-                        if (wIt != probe.stageData.end()) p["weight"] = wIt->second.data[*pos * K + k];
-                        picksAt.push_back(std::move(p));
-                    }
-                    b["picks_at_position"] = picksAt;
-                }
-                blocks.push_back(std::move(b));
-            }
-            if (blocks.empty()) {
+            json out = expertUsage(e, ids, probe, pos, topN);
+            if (out.is_null()) {
                 throw std::runtime_error("no MoE routing captured — '" + e.config().architecture +
                                          "' is dense or its backend does not expose the routing "
                                          "tap yet (supported: qwen35moe-family, kolibri1)");
             }
-            json overall = json::array();
-            for (const auto ex : LogitMath::topK(totalCount, topN)) {
-                overall.push_back({{"expert", ex}, {"tokens", totalCount[static_cast<std::size_t>(ex)]}});
-            }
-            std::size_t neverUsed = 0;
-            for (const double c : totalCount) neverUsed += c == 0 ? 1U : 0U;
-            json out{{"tokens", ids.size()}, {"experts", nExperts}, {"moe_blocks", blocks.size()},
-                     {"never_used_experts", neverUsed}, {"top_overall", overall}, {"blocks", blocks}};
             if (!runes.empty()) {
                 out["runes"] = runes;
             }
             if (pos) {
                 out["position"] = *pos;
                 out["token_at_position"] = piece(e, ids[*pos]);
+            }
+            return out;
+        });
+
+    server.addTool(
+        "trace",
+        "One prompt through the whole model in ONE forward, with everything a picture of the "
+        "run needs: tokens, the next-token top-k, per block the logit lens and the residual "
+        "statistics (raw vector with 'values', default true), the attention pattern of every "
+        "block where the backend exposes the stages ('attention': false skips it), and the MoE "
+        "routing. Sections carry the single tools' names and shapes (tokenize, next_token, "
+        "logit_lens, activations, attention_pattern[], expert_usage) plus 'model' (sizes and "
+        "per-block layer kinds) and 'notes' for what could not be captured. Memory grows with "
+        "tokens x blocks; meant for prompts up to a few hundred tokens.",
+        schema(textProps({{"position", {{"type", "integer"}, {"description", "token index; negative counts from the end"}}},
+                          {"top_k", {{"type", "integer"}, {"description", "lens / next-token top-k (default 5)"}}},
+                          {"top_dims", {{"type", "integer"}}},
+                          {"values", {{"type", "boolean"}, {"description", "raw residual per block (default true)"}}},
+                          {"attention", {{"type", "boolean"}}},
+                          {"attention_top_k", {{"type", "integer"}}},
+                          {"expert_top_k", {{"type", "integer"}}},
+                          {"runes", {{"type", "array"}, {"items", {{"type", "string"}}}}}}),
+               {}),
+        [this](const json& a) {
+            const auto runes = a.value("runes", std::vector<std::string>{});
+            Engine&    e   = runes.empty() ? base() : withRunes(runes);
+            const auto ids = inputTokens(e, a);
+            const std::size_t pos = positionArg(a, ids.size());
+            const auto&       cfg = e.config();
+            const std::uint32_t B = cfg.blockCount;
+            const std::size_t   d = cfg.embeddingLength;
+            const bool withAttention = a.value("attention", true);
+
+            Engine::ForwardProbe probe;
+            for (std::uint32_t b = 0; b < B; ++b) {
+                probe.hiddenBlocks.push_back(b);
+                probe.lensBlocks.push_back(b);
+            }
+            probe.lensPosition = pos;
+            probe.stages = {"moe_topk_idx", "moe_topk_w"};
+            if (withAttention) {
+                for (const char* s : {"Qcur", "Kcur", "Vcur", "attn_ctx", "attn_scale", "attn_window"}) {
+                    probe.stages.emplace_back(s);
+                }
+            }
+            const auto lg = forward(e, ids, &probe);
+            const std::size_t k = a.value("top_k", std::size_t{5});
+            const auto piece_ = pieceOf(e);
+            json notes = json::array();
+
+            json pieces = json::array();
+            for (const auto id : ids) {
+                pieces.push_back(piece(e, id));
+            }
+
+            const auto finalLp = logProbs(e, lg[pos]);
+            const auto finalId = LogitMath::topK(finalLp, 1).front();
+            json lens = json::array();
+            for (const auto& [b, logits] : probe.lens) {
+                const auto lp = logProbs(e, logits);
+                lens.push_back({{"block", b}, {"entropy", LogitMath::entropy(lp)},
+                                {"final_token_prob", std::exp(lp[static_cast<std::size_t>(finalId)])},
+                                {"final_token_rank", LogitMath::rankOf(lp, static_cast<std::size_t>(finalId))},
+                                {"top", topJson(e, lp, k)}});
+            }
+
+            const std::size_t topDims = a.value("top_dims", std::size_t{8});
+            const bool values = a.value("values", true);
+            json acts = json::array();
+            std::optional<std::span<const float>> prev;
+            for (std::uint32_t b = 0; b < B; ++b) {
+                const auto it = probe.hidden.find(b);
+                if (it == probe.hidden.end() || it->second.size() < (pos + 1) * d) {
+                    prev.reset();
+                    continue;
+                }
+                const std::span<const float> x(it->second.data() + pos * d, d);
+                acts.push_back(ForwardReport::residual(b, x, prev, topDims, values));
+                prev = x;
+            }
+
+            json attention = json::array();
+            if (withAttention) {
+                ForwardReport::AttentionOptions o;
+                o.position = pos;
+                o.topK     = a.value("attention_top_k", std::size_t{3});
+                for (std::uint32_t b = 0; b < B; ++b) {
+                    const auto st = attentionStages(e, probe, b);
+                    if (!st) {
+                        continue;   // e.g. a linear-attention block of a hybrid model
+                    }
+                    try {
+                        attention.push_back(ForwardReport::attention(*st, ids, piece_, b, o));
+                    } catch (const std::exception& ex) {
+                        notes.push_back("attention block " + std::to_string(b) + ": " + ex.what());
+                    }
+                }
+                if (attention.empty()) {
+                    notes.push_back("'" + cfg.architecture + "' does not expose the attention stages");
+                }
+            }
+
+            const json moe = expertUsage(e, ids, probe, pos, a.value("expert_top_k", std::size_t{8}));
+
+            json model{{"name", std::filesystem::path(_target().path).filename().string()},
+                       {"architecture", cfg.architecture}, {"d_model", d}, {"blocks", B},
+                       {"heads", cfg.headCount}, {"kv_heads", cfg.headCountKv},
+                       {"experts", cfg.expertCount}, {"experts_per_token", cfg.expertUsedCount}};
+            if (cfg.isHybridRecurrent()) {
+                json kinds = json::array();
+                for (std::uint32_t b = 0; b < B; ++b) kinds.push_back(cfg.isRecurrentLayer(b) ? "linear" : "full");
+                model["block_kinds"] = kinds;
+            } else if (cfg.slidingWindowPattern.size() == B) {
+                json kinds = json::array();
+                for (std::uint32_t b = 0; b < B; ++b) kinds.push_back(cfg.slidingWindowPattern[b] ? "sliding" : "global");
+                model["block_kinds"] = kinds;
+            }
+
+            json out{{"model", model},
+                     {"tokenize", {{"count", ids.size()}, {"ids", ids}, {"pieces", pieces}}},
+                     {"next_token", {{"entropy", LogitMath::entropy(finalLp)}, {"top", topJson(e, finalLp, k)}}},
+                     {"logit_lens", {{"position", pos}, {"token_at_position", piece(e, ids[pos])},
+                                     {"final_prediction", {{"id", finalId}, {"piece", piece(e, finalId)},
+                                                           {"prob", std::exp(finalLp[static_cast<std::size_t>(finalId)])}}},
+                                     {"blocks", lens}}},
+                     {"activations", {{"position", pos}, {"token_at_position", piece(e, ids[pos])},
+                                      {"d_model", d}, {"blocks", acts}}},
+                     {"attention_pattern", attention},
+                     {"notes", notes}};
+            if (!moe.is_null()) {
+                out["expert_usage"] = moe;
+                out["expert_usage"]["position"] = pos;
+            }
+            if (a.contains("text")) {
+                out["prompt"] = a["text"];
+            }
+            if (!runes.empty()) {
+                out["runes"] = runes;
             }
             return out;
         });

@@ -257,6 +257,7 @@ exactly as in serving.
 | `activations` | Residual statistics per block (norm, update, cosine, top dims) |
 | `attention_pattern` | One block's attention weights per head, rebuilt from the engine's post-RoPE Q/K |
 | `expert_usage` | MoE routing actually taken (stage tap at the router selection) |
+| `trace` | One forward, everything for a picture of the run: tokens, next-token top-k, per block logit lens + residual (raw vector by default), attention pattern of every block that exposes the stages, MoE routing, model sizes and per-block layer kinds. Sections carry the single tools' names and shapes (e.g. for jsNGraph's NetView) |
 | `causal_trace` | Activation patching clean → corrupt per (block, position) |
 | `causality_check` | Is a located edit (steer vector at α, or head edits) more than a random edit of the same size? Dose sweep + verdict causal / weak / epiphenomenal / undetermined + measured dose (§4) |
 | `edit_search` | Multi-objective edit search (own TPE, no Optuna): head count k / scale / block window, or steer α; target goldset up, control KL down, no free-generation regression; returns the Pareto front plus every trial in short form. `scales` (e.g. `[2, 4]`) restricts the scale to a discrete set — use powers of two on FP8 / Q8_0 block-scaled weights so the staged rune stays exact. Head trials run as temporary runes through the load path (KV-cached, identical to a staged rune). Stage a front point with `rune_stage_heads` / `rune_stage_steer` + `search` + `trial` (parameters and seed in the provenance) |

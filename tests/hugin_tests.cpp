@@ -8,6 +8,7 @@
 #include "core/rune/RuneApplier.hpp"
 #include "core/rune/RuneFile.hpp"
 #include "core/rune/RuneFormat.hpp"
+#include "hugin/ForwardReport.hpp"
 #include "hugin/ForwardTools.hpp"
 #include "hugin/GenerationCheck.hpp"
 #include "hugin/HostDequant.hpp"
@@ -142,7 +143,7 @@ TEST(mcp_initialize_and_toolsList) {
                                                    "rune_stage_steer", "rune_stage_steer_if",
                                                    "steer_if_preview", "steer_list", "steer_preview",
                                                    "steer_vector", "tensor_hash",
-                                                   "tensor_stats", "tokenize"}));
+                                                   "tensor_stats", "tokenize", "trace"}));
 }
 
 TEST(mcp_protocolErrors) {
@@ -261,7 +262,7 @@ TEST(forwardTools_withoutModel_reportToolError_noEngineBuilt) {
     hg::ForwardTools fwd{[] { return hg::ForwardTools::Target{}; }};
     fwd.registerOn(server);
     for (const char* tool : {"next_token", "perplexity", "logit_lens", "activations", "tokenize",
-                             "attention_pattern", "expert_usage"}) {
+                             "attention_pattern", "expert_usage", "trace"}) {
         const json r = (*server.handle({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
                                         {"params", {{"name", tool}, {"arguments", {{"text", "hi"}}}}}}))["result"];
         EXPECT_TRUE(r["isError"].get<bool>());
@@ -381,6 +382,88 @@ TEST(logitMath_logSoftmax_topK_rank_entropy_kl) {
     std::vector<float> capped{100.0f, -100.0f, 0.0f};
     hg::LogitMath::softcap(capped, 30.0f);
     EXPECT_TRUE(capped[0] < 30.0f && capped[0] > 29.0f && capped[1] > -30.0f && capped[2] == 0.0f);
+}
+
+TEST(forwardReport_attention_causal_window_span_consistency) {
+    using Stage = hg::ForwardReport::Stage;
+    // 3 tokens, 2 heads sharing one KV head, head dim 2, query at position 2.
+    Stage Q{3, 4, {0, 0, 0, 0,   0, 0, 0, 0,   10, 0, 0, 0}};
+    Stage K{3, 2, {0, 0,   1, 0,   0, 0}};
+    Stage V{3, 2, std::vector<float>(6, 1.0f)};   // all-ones V: weights x V == 1 for any weights
+    Stage C{3, 4, std::vector<float>(12, 1.0f)};
+    const std::vector<std::int32_t> ids{7, 8, 9};
+    const auto piece = [](std::int32_t id) { return "t" + std::to_string(id); };
+    hg::ForwardReport::AttentionStages s{&Q, &K, &V, &C, 1.0, 0, 2};
+    hg::ForwardReport::AttentionOptions o;
+    o.position = 2;
+    o.topK     = 2;
+    o.span     = std::pair<std::size_t, std::size_t>{0, 2};
+    const json r = hg::ForwardReport::attention(s, ids, piece, 4, o);
+    EXPECT_EQ(r["block"].get<int>(), 4);
+    EXPECT_EQ(r["kv_heads"].get<int>(), 1);
+    EXPECT_EQ(r["query_token"].get<std::string>(), std::string{"t9"});
+    const json& h0 = r["per_head"][0];
+    const json& h1 = r["per_head"][1];
+    EXPECT_EQ(h0["top"][0]["pos"].get<int>(), 1);                       // q.k = 10 on key 1
+    EXPECT_TRUE(h0["top"][0]["weight"].get<double>() > 0.999);
+    EXPECT_TRUE(nearD(h1["entropy"].get<double>(), std::log(3.0)));      // q = 0: uniform
+    EXPECT_TRUE(h0["span_weight"].get<double>() > 0.999);
+    EXPECT_TRUE(r["consistency"]["max_abs_err"].get<double>() < 1e-9);
+    EXPECT_EQ(r["heads_by_span_weight"][0]["head"].get<int>(), 0);
+
+    // Sliding window of 2: key 0 is masked, head 1 spreads over keys 1..2.
+    s.window = 2;
+    o.span.reset();
+    const json w = hg::ForwardReport::attention(s, ids, piece, 4, o);
+    EXPECT_TRUE(nearD(w["per_head"][1]["bos_weight"].get<double>(), 0.0));
+    EXPECT_TRUE(nearD(w["per_head"][1]["entropy"].get<double>(), std::log(2.0)));
+
+    // Shapes that do not fit the tokens / heads are refused.
+    bool threw = false;
+    try { (void)hg::ForwardReport::attention(s, std::vector<std::int32_t>{1, 2}, piece, 0, o); }
+    catch (const std::exception&) { threw = true; }
+    EXPECT_TRUE(threw);
+    s.headCount = 3;
+    threw = false;
+    try { (void)hg::ForwardReport::attention(s, ids, piece, 0, o); }
+    catch (const std::exception&) { threw = true; }
+    EXPECT_TRUE(threw);
+}
+
+TEST(forwardReport_residual_stats_update_and_nonFinite) {
+    const std::vector<float> x{3, 4}, prev{3, 0};
+    const json r = hg::ForwardReport::residual(5, x, std::span<const float>(prev), 1, true);
+    EXPECT_TRUE(nearD(r["l2"].get<double>(), 5.0));
+    EXPECT_TRUE(nearD(r["update_l2"].get<double>(), 4.0));
+    EXPECT_TRUE(nearD(r["cos_prev_block"].get<double>(), 0.6));
+    EXPECT_EQ(r["top_dims"][0]["dim"].get<int>(), 1);
+    EXPECT_EQ(r["values"].size(), std::size_t{2});
+    const std::vector<float> bad{std::nanf(""), 2};
+    const json b = hg::ForwardReport::residual(0, bad, std::nullopt, 2, false);
+    EXPECT_EQ(b["non_finite"].get<int>(), 1);
+    EXPECT_TRUE(nearD(b["l2"].get<double>(), 2.0));
+    EXPECT_TRUE(!b.contains("update_l2") && !b.contains("values"));
+}
+
+TEST(forwardReport_expertBlock_counts_picks_and_summary) {
+    using Stage = hg::ForwardReport::Stage;
+    const Stage idx{2, 2, {1, 2,   2, 3}};
+    const Stage w{2, 2, {0.5f, 0.5f,   0.6f, 0.4f}};
+    std::vector<double> total;
+    const json b = hg::ForwardReport::expertBlock(3, idx, &w, 4, 2, std::size_t{1}, total);
+    EXPECT_EQ(b["distinct_experts"].get<int>(), 3);
+    EXPECT_EQ(b["top_by_count"][0]["expert"].get<int>(), 2);
+    EXPECT_TRUE(nearD(b["top_by_count"][0]["tokens"].get<double>(), 2.0));
+    EXPECT_TRUE(std::fabs(b["top_by_weight"][0]["weight"].get<double>() - 1.1) < 1e-6);   // float weights
+    EXPECT_EQ(b["picks_at_position"][0]["expert"].get<int>(), 2);
+    EXPECT_TRUE(std::fabs(b["picks_at_position"][1]["weight"].get<double>() - 0.4) < 1e-6);
+    const json sum = hg::ForwardReport::expertSummary(total, 2);
+    EXPECT_EQ(sum["never_used_experts"].get<int>(), 1);
+    EXPECT_EQ(sum["top_overall"][0]["expert"].get<int>(), 2);
+    bool threw = false;
+    try { (void)hg::ForwardReport::expertBlock(0, idx, nullptr, 3, 2, std::nullopt, total); }
+    catch (const std::exception&) { threw = true; }
+    EXPECT_TRUE(threw);   // expert 3 out of range for 3 experts
 }
 
 TEST(eval_withoutModel_andBadGoldset_reportToolError) {
