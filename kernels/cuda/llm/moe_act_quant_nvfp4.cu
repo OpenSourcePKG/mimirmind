@@ -300,3 +300,15 @@ void moe_act_quant_nvfp4_rows(
     SFout[aq_sf_offset(row, blk, numKTiles)] =
         *reinterpret_cast<const unsigned char*>(&sfE4m3);
 }
+
+// 7.14 encoder self-test: code[i] = aq_e2m1(in[i]) for n inputs, so
+// cuda_parity_tests checks the software E2M1 encoder (exact grid values and
+// the round-to-nearest-even ties) against the host reference. Never launched
+// on the serving path.
+extern "C" __global__ void moe_act_quant_nvfp4_e2m1_selftest(const float* in, unsigned* code, int n)
+{
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) {
+        code[i] = aq_e2m1(in[i]);
+    }
+}

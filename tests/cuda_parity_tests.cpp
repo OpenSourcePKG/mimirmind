@@ -46,6 +46,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <map>
 #include <span>
 #include <stdexcept>
@@ -3402,6 +3403,103 @@ TEST(cuda_moe_grouped_gemm_parity_prod) {
         c = static_cast<std::int32_t>(u * 32.0f);
     }
     checkMoeGroupedGemmParity(counts, /*N=*/128, /*K=*/128, 0x5150u);
+}
+
+// 7.14: every kernel file carries its own E2M1 decoder (dq_e2m1). Each exposes
+// a <stem>_e2m1_selftest kernel writing dq_e2m1(c) for c = 0..15; all 16 codes
+// must equal the host reference exactly. A decoder slip (the 7.13 deint bug:
+// code 1 -> 0.75) fails here even when two kernels agree with each other.
+TEST(cuda_e2m1_decoders_match_host_reference) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+    namespace cc = ::mimirmind::core::cuda;
+    namespace mo = ::mimirmind::core::modelopt;
+    const char* modules[] = {
+        "dequant_nvfp4", "matmul_nvfp4blk_gemm", "matmul_nvfp4blk_vec", "matmul_nvfp4blk_deint_vec",
+        "moe_down_fused_k_nvfp4blk_batched", "moe_down_fused_k_nvfp4tc_batched",
+        "moe_gate_up_fused_k_nvfp4blk_batched", "moe_gate_up_fused_k_nvfp4tc_batched",
+        "moe_grouped_gemm_nvfp4blk", "moe_grouped_gemm_nvfp4blk_tc"};
+    std::vector<float> zeros(16, -99.0f);
+    for (const char* m : modules) {
+        cc::CudaModule mod = cc::CudaModule::fromFile(ctx.cudaContext(), resolvePtx(m));
+        cc::CudaKernel k   = mod.getFunction(std::string{m} + "_e2m1_selftest");
+        auto dOut = uploadRaw(ops, zeros);
+        k.setPtr(0, dOut.get());
+        k.launch(ctx.stream(), 1, 1, 1, 32, 1, 1);
+        ops.flush();
+        const auto got = fromDevice(ops, dOut.get(), 16);
+        int bad = 0;
+        for (unsigned c = 0; c < 16; ++c) {
+            const float want = mo::e2m1ToFloat(static_cast<std::uint8_t>(c));
+            if (got[c] != want) {
+                ++bad;
+                std::printf("[e2m1] %s code %u: got %g want %g\n", m, c, got[c], want);
+            }
+        }
+        std::printf("[e2m1] %-40s %s\n", m, bad == 0 ? "16/16 exact" : "MISMATCH");
+        EXPECT_EQ(bad, 0);
+    }
+}
+
+// 7.14: the software E2M1 encoder of the activation quantiser (aq_e2m1) vs a
+// host reference derived from e2m1ToFloat: nearest grid value, ties to the
+// even code, saturation at 6, sign kept. Compared by decoded value (+-0 equal).
+TEST(cuda_e2m1_encoder_matches_host_reference) {
+    CudaComputeContext ctx{};
+    GpuOps ops{ctx};
+    namespace cc = ::mimirmind::core::cuda;
+    namespace mo = ::mimirmind::core::modelopt;
+    const auto refCode = [&](float v) {
+        const float a = std::fabs(v);
+        unsigned best = 0;
+        float bestErr = std::numeric_limits<float>::infinity();
+        for (unsigned c = 0; c < 8; ++c) {
+            const float err = std::fabs(mo::e2m1ToFloat(static_cast<std::uint8_t>(c)) - a);
+            if (err < bestErr || (err == bestErr && (c % 2) == 0)) {
+                bestErr = err;
+                best    = c;
+            }
+        }
+        return best | (v < 0.0f ? 0x8u : 0x0u);
+    };
+    std::vector<float> in;
+    for (unsigned c = 0; c < 8; ++c) {
+        const float g = mo::e2m1ToFloat(static_cast<std::uint8_t>(c));
+        in.push_back(g);
+        in.push_back(-g);
+        if (c + 1 < 8) {   // exact midpoints = the RNE ties
+            const float mid = 0.5f * (g + mo::e2m1ToFloat(static_cast<std::uint8_t>(c + 1)));
+            in.push_back(mid);
+            in.push_back(-mid);
+        }
+    }
+    for (const float v : {0.1f, 0.3f, 0.7f, 1.1f, 1.3f, 1.9f, 2.7f, 3.2f, 4.6f, 5.4f, 6.5f, 100.0f}) {
+        in.push_back(v);
+        in.push_back(-v);
+    }
+    const int n = static_cast<int>(in.size());
+    cc::CudaModule mod = cc::CudaModule::fromFile(ctx.cudaContext(), resolvePtx("moe_act_quant_nvfp4"));
+    cc::CudaKernel k   = mod.getFunction("moe_act_quant_nvfp4_e2m1_selftest");
+    auto dIn   = toDevice(ops, in);
+    auto dCode = uploadRaw(ops, std::vector<std::uint32_t>(in.size(), 0xFFu));
+    k.setPtr(0, dIn.get());
+    k.setPtr(1, dCode.get());
+    k.setValue(2, n);
+    k.launch(ctx.stream(), static_cast<std::uint32_t>((n + 63) / 64), 1, 1, 64, 1, 1);
+    ops.flush();
+    std::vector<std::uint32_t> code(in.size());
+    ops.readbackToHost(code.data(), dCode.get(), code.size() * sizeof(std::uint32_t));
+    int bad = 0;
+    for (int i = 0; i < n; ++i) {
+        const float got  = code[i] < 16 ? mo::e2m1ToFloat(static_cast<std::uint8_t>(code[i])) : NAN;
+        const float want = mo::e2m1ToFloat(static_cast<std::uint8_t>(refCode(in[i])));
+        if (!(got == want)) {
+            ++bad;
+            std::printf("[e2m1-enc] in %g: code %u (%g) want %g\n", in[i], code[i], got, want);
+        }
+    }
+    std::printf("[e2m1-enc] %d inputs, %d mismatches\n", n, bad);
+    EXPECT_EQ(bad, 0);
 }
 
 // NVFP4 de-interleaved vectorised matvec (M=1) — parity vs the 20-byte blocked

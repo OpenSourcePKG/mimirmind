@@ -138,3 +138,14 @@ void moe_down_fused_k_nvfp4tc_batched(
     accumSum = warp16_reduce_sum(accumSum);
     if (active && sgLocal == 0) accumB[n] += accumSum;
 }
+
+// 7.14 decoder self-test: out[c] = this file's dq_e2m1(c) for all 16 codes, so
+// cuda_parity_tests checks every E2M1 decoder copy against the host reference
+// (core::modelopt::e2m1ToFloat). Never launched on the serving path.
+extern "C" __global__ void moe_down_fused_k_nvfp4tc_batched_e2m1_selftest(float* out)
+{
+    const unsigned c = threadIdx.x;
+    if (c < 16u) {
+        out[c] = dq_e2m1(c);
+    }
+}

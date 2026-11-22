@@ -73,3 +73,14 @@ void dequant_nvfp4(
 
     out[gid] = __float2bfloat16(global_scale * blk * dq_e2m1(nib));
 }
+
+// 7.14 decoder self-test: out[c] = this file's dq_e2m1(c) for all 16 codes, so
+// cuda_parity_tests checks every E2M1 decoder copy against the host reference
+// (core::modelopt::e2m1ToFloat). Never launched on the serving path.
+extern "C" __global__ void dequant_nvfp4_e2m1_selftest(float* out)
+{
+    const unsigned c = threadIdx.x;
+    if (c < 16u) {
+        out[c] = dq_e2m1(c);
+    }
+}
