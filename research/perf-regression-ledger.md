@@ -639,3 +639,19 @@ allocations) — ~41 GiB pinned for the process lifetime.
 **Live verify after deploy:** health 200 (4 models), restarts 0, MemAvailable
 64.5 GiB after a bench, probe identical to the window 10/10, conc1 29.5, conc8
 63.2 tok/s, embed + rerank OK, 0 illegal access. Pool release at load: 0.6 s.
+
+## 2026-11-22 — 7.2.4 shared weight arena on 2 MiB pages = GB10 prod default for kolibri1
+
+**Binary:** prod 1c493357 -> fe8e80a9 (HEAD with 7.2.4). **Config:** kolibri1 gets
+`"sharedWeights": {"socket": "/src/run/kolibri1.sock"}` (243ce00d -> 880b7611).
+Rollback: `build-cudnn/mimirmind.prodbak_724` + `config.serve.json.prodbak_724`;
+`MIMIRMIND_ARENA_HUGE=0` keeps the arena on 4 KiB pages (−4.6% / −2.5% decode).
+
+**Window A/B (Kolibri-1-only server, out724b):** arena 45.8 GiB PMD-mapped; decode
+conc1 29.73 vs managed 29.70, conc8 63.93 vs 63.87 tok/s; answers identical 10/10.
+
+**Live verify after deploy:** health 200 (4 models), restarts 0, 46924 MiB collapsed
+(3336 MiB = freed load-time holes, logged as WARN), 903 tensors published on the
+socket, probe identical to pre-deploy prod 10/10, conc1 29.4/29.8, conc8 62.9/64.5
+tok/s, embed + rerank OK, 0 illegal access, MemAvailable 64.7 GiB.
+Hugin can now attach to prod with `--attach /src/run/kolibri1.sock`.
